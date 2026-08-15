@@ -1248,48 +1248,54 @@ async def send_one(job:dict[str,Any],user_id:int,chat_id:int,idx:int,quality:str
 
 
 async def send_spotify(job:dict[str,Any],user_id:int,chat_id:int):
-    tmp=Path(tempfile.mkdtemp(prefix="bluegate_spotify_"))
+    """Spotify Track -> FastSaver Music Search (2cr) -> Music Download/tg-bot (7cr).
+
+    IMPORTANT: Spotify must never call /youtube/download. The normal successful path
+    uses exactly one music search plus one music download (9 credits total) unless
+    the Telegram file_id is already cached locally, in which case the download call
+    is skipped.
+    """
     try:
         m=SPOTIFY_RE.search(job["source_url"])
         if not m or m.group(1).lower() != "track":
             raise RuntimeError("فعلاً فقط Spotify Track تکی پشتیبانی می‌شود.")
-        await send_text(chat_id,"🟢 Spotify شناسایی شد؛ دارم نسخه متناظر رو پیدا می‌کنم…")
+
+        await send_text(chat_id,"🟢 Spotify شناسایی شد؛ Music Search → Music Download…")
         meta=await asyncio.to_thread(spotify_oembed_sync,job["source_url"])
         title=str(meta.get("title") or job["result"].get("title") or "").strip()
         artist=str(meta.get("author_name") or "").strip()
-        if not title: raise RuntimeError("عنوان ترک Spotify پیدا نشد.")
-        queries=[]
-        base=f"{artist} - {title}" if artist and artist.lower() not in title.lower() else title
-        for q in (base+" official audio",base+" topic",base):
-            if q not in queries: queries.append(q)
-        last=None
-        for q in queries:
-            try:
-                log.info("spotify-resolver: search=%r",q)
-                result=await fastsaver_search_music(q)
-                vid=str(result["video_id"])
-                yt_url=f"https://www.youtube.com/watch?v={vid}"
-                # Use the same proven /youtube/download path as normal YouTube, not tg-bot/fetch.
-                data=await fastsaver_json("POST","/youtube/download",payload={"url":yt_url,"format":"mp3"},timeout=FASTSAVER_TIMEOUT)
-                dl=data.get("download_url")
-                if not dl: raise RuntimeError("FastSaver MP3 download_url نداد.")
-                fn=re.sub(r"[^A-Za-z0-9._ -]+","_",str(data.get("filename") or f"{title}.mp3"))[:180]
-                if not fn.lower().endswith(".mp3"): fn += ".mp3"
-                path=tmp/fn
-                await download_url(str(dl),path)
-                ok=await send_file(chat_id,path,"audio",f"{html.escape(BRAND_NAME)} · Spotify · {html.escape(title)[:120]}")
-                if not ok: raise RuntimeError("Telegram فایل Spotify را ارسال نکرد.")
-                record_download(user_id,job["job_id"],"audio","FastSaver MP3",path.stat().st_size,"spotify")
-                await send_text(chat_id,"✅ Spotify Track ارسال شد.")
-                return
-            except Exception as exc:
-                last=exc; log.warning("spotify-resolver query failed: %s",exc)
-        raise RuntimeError(f"Spotify resolver failed: {last}")
+        if not title:
+            raise RuntimeError("عنوان ترک Spotify پیدا نشد.")
+
+        # ONE search request only: FastSaver Music Search = 2 credits.
+        query=f"{artist} - {title}" if artist and artist.lower() not in title.lower() else title
+        log.info("spotify-music: Music Search (2cr) query=%r", query)
+        result=await fastsaver_search_music(query)
+        video_id=str(result.get("video_id") or "").strip()
+        if not video_id:
+            raise RuntimeError("FastSaver Music Search نتیجه معتبر با video_id نداد.")
+
+        # Music Download = /youtube/audio/tg-bot = 7 credits.
+        # This returns a Telegram file_id and does NOT use the Video Download endpoint.
+        bot_username=(await ensure_bot_username()).lower()
+        cache_key=f"spotify:{video_id}:{bot_username}"
+        cached=get_cached_file_id(cache_key)
+        if cached:
+            log.info("spotify-music: cache hit; Music Download call skipped video_id=%s", video_id)
+            file_id=cached
+            qlabel="FastSaver Music cache"
+        else:
+            log.info("spotify-music: Music Download (7cr) video_id=%s", video_id)
+            file_id=await fastsaver_audio_file_id(video_id,cache_key,title,"spotify")
+            qlabel="FastSaver Music Search 2cr + Music Download 7cr"
+
+        caption=f"{html.escape(BRAND_NAME)} · Spotify · {html.escape(title)[:120]}"
+        await send_audio_file_id(chat_id,file_id,caption)
+        record_download(user_id,job["job_id"],"audio",qlabel,0,"spotify")
+        await send_text(chat_id,"✅ Spotify Track ارسال شد.\n⚡ مسیر: Music Search + Music Download")
     except Exception as exc:
-        log_error(user_id,"spotify",exc); log.exception("spotify-fastsaver failed")
+        log_error(user_id,"spotify",exc); log.exception("spotify-music failed")
         await send_text(chat_id,"❌ دانلود Spotify ناموفق بود.\n\n<code>"+html.escape(str(exc))[:900]+"</code>")
-    finally:
-        shutil.rmtree(tmp,ignore_errors=True)
 
 
 async def send_all(job:dict[str,Any],user_id:int,chat_id:int):
@@ -1436,7 +1442,7 @@ async def admin_system(chat_id:int):
     du=shutil.disk_usage('/tmp'); up=now_ts()-STARTED_AT; pool=fastsaver_pool_summary()
     text=(f"🩺 <b>System Status</b>\n\n✅ Bot: Online\n⏱ Uptime: <b>{up//3600}h {(up%3600)//60}m</b>\n"
           f"💽 /tmp free: <b>{du.free/(1024**3):.2f} GB</b>\n🗃 DB: <b>{db_backend()}</b>\n"
-          f"⚡ FastSaver Pool: <b>{pool['total']}</b> keys / <b>{pool['active']}</b> active\n📦 Version: <b>4.2</b>")
+          f"⚡ FastSaver Pool: <b>{pool['total']}</b> keys / <b>{pool['active']}</b> active\n📦 Version: <b>4.2.1</b>")
     await send_text(chat_id,text)
 
 
@@ -1489,7 +1495,7 @@ HELP_TEXT=(
     "▶️ <b>YouTube</b> — Video / Shorts + Audio (FastSaver API)\n"
     "𝕏 <b>X / Twitter</b> — Video / GIF / media\n"
     "☁️ <b>SoundCloud</b> — Track / set + MP3\n"
-    "🟢 <b>Spotify</b> — Track → YouTube Music match via FastSaver API Pool\n\n"
+    "🟢 <b>Spotify</b> — Track → FastSaver Music Search (2cr) + Music Download (7cr)\n\n"
     f"📦 حداکثر آیتم Playlist در هر درخواست: <b>{MAX_PLAYLIST_ITEMS}</b>\n"
     "فقط محتوایی رو دانلود کن که اجازه ذخیره/استفاده ازش رو داری."
 )
@@ -1542,7 +1548,7 @@ async def handle_message(message:dict[str,Any]):
     except Exception as exc:
         log_error(user_id,platform,exc); log.exception("analyze failed")
         hints={"instagram":"اگر محتوا Private/Story باشه ممکنه Cookie لازم باشه.","youtube":"YouTube از FastSaver API Pool استفاده می‌کند؛ وضعیت APIها را در پنل ادمین ببین.",
-               "soundcloud":"SoundCloud گاهی extractor را موقتاً محدود می‌کند.","spotify":"Spotify از FastSaver API Pool + YouTube Music استفاده می‌کند؛ فعلاً Track تکی پشتیبانی می‌شود."}
+               "soundcloud":"SoundCloud گاهی extractor را موقتاً محدود می‌کند.","spotify":"Spotify فقط از FastSaver Music Search (2cr) + Music Download (7cr) استفاده می‌کند؛ Video Download استفاده نمی‌شود."}
         await edit_text(chat_id,status["message_id"],f"❌ نتونستم لینک رو بخونم.\n\n💡 {hints.get(platform,'')}\n\n<code>{html.escape(str(exc))[:500]}</code>")
 
 
@@ -1680,7 +1686,7 @@ async def root(): return PlainTextResponse(f"{BRAND_NAME} V4.2 is running ✅")
 
 
 @app.get("/health")
-async def health(): return JSONResponse({"ok":True,"version":"4.2","platforms":["instagram","youtube","twitter","soundcloud","spotify"],"youtube_provider":"FastSaverAPI","spotify_provider":"FastSaverAPI"})
+async def health(): return JSONResponse({"ok":True,"version":"4.2.1","platforms":["instagram","youtube","twitter","soundcloud","spotify"],"youtube_provider":"FastSaverAPI","spotify_provider":"FastSaverAPI"})
 
 
 @app.post("/telegram/{secret}")
