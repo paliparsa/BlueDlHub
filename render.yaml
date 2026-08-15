@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: insta-telegram-downloader
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: MAX_SEND_MB
+        value: "49"
