@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 # Avoid httpx logging full Telegram Bot API URLs (which contain the bot token).
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-log = logging.getLogger("bluegate-downloader-v3")
+log = logging.getLogger("bluegate-downloader-v4")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
@@ -48,6 +48,10 @@ SPOTIFY_BITRATE = os.getenv("SPOTIFY_BITRATE", "128k").strip()
 YOUTUBE_POT_ENABLED = os.getenv("YOUTUBE_POT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 YOUTUBE_POT_BASE_URL = os.getenv("YOUTUBE_POT_BASE_URL", "http://127.0.0.1:4416").strip()
 YOUTUBE_PLAYER_CLIENT = os.getenv("YOUTUBE_PLAYER_CLIENT", "mweb").strip() or "mweb"
+FASTSAVER_API_KEY = os.getenv("FASTSAVER_API_KEY", "").strip()
+FASTSAVER_BASE_URL = os.getenv("FASTSAVER_BASE_URL", "https://api.fastsaver.io/v1").strip().rstrip("/")
+FASTSAVER_BOT_USERNAME = os.getenv("FASTSAVER_BOT_USERNAME", "").strip()
+FASTSAVER_TIMEOUT = int(os.getenv("FASTSAVER_TIMEOUT", "300"))
 
 def prepare_runtime_cookies() -> None:
     """Materialize base64-encoded Netscape cookies from Render secrets."""
@@ -69,7 +73,7 @@ if not BOT_TOKEN:
     log.warning("BOT_TOKEN is not set")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-app = FastAPI(title="BlueGate Multi Downloader V3.3")
+app = FastAPI(title="BlueGate Multi Downloader V4 API Edition")
 loader = instaloader.Instaloader(download_pictures=False, download_videos=False, save_metadata=False, quiet=True)
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
@@ -122,6 +126,9 @@ def init_db():
             media_type TEXT, quality TEXT, bytes INTEGER DEFAULT 0,
             platform TEXT DEFAULT 'unknown', created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS media_cache (
+            cache_key TEXT PRIMARY KEY, file_id TEXT NOT NULL, title TEXT, platform TEXT, updated_at INTEGER NOT NULL
+        );
         """)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(downloads)").fetchall()}
         if "platform" not in cols:
@@ -161,6 +168,20 @@ def record_download(user_id: int, job_id: str, media_type: str, quality: str, si
     with db() as conn:
         conn.execute("INSERT INTO downloads(user_id,job_id,media_type,quality,bytes,platform,created_at) VALUES(?,?,?,?,?,?,?)",
                      (user_id, job_id, media_type, quality, size, platform, now_ts()))
+
+
+def get_cached_file_id(cache_key: str) -> str | None:
+    with db() as conn:
+        row = conn.execute("SELECT file_id FROM media_cache WHERE cache_key=?", (cache_key,)).fetchone()
+    return row["file_id"] if row else None
+
+
+def set_cached_file_id(cache_key: str, file_id: str, title: str = "", platform: str = "") -> None:
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO media_cache(cache_key,file_id,title,platform,updated_at) VALUES(?,?,?,?,?)
+            ON CONFLICT(cache_key) DO UPDATE SET file_id=excluded.file_id,title=excluded.title,platform=excluded.platform,updated_at=excluded.updated_at
+        """, (cache_key, file_id, title, platform, now_ts()))
 
 
 def stats() -> dict[str, Any]:
@@ -353,6 +374,136 @@ def analyze_generic_ydl(url: str, platform: str, kind: str | None = None) -> dic
             "media":media}
 
 
+def fastsaver_headers() -> dict[str, str]:
+    if not FASTSAVER_API_KEY:
+        raise RuntimeError("FASTSAVER_API_KEY روی Render تنظیم نشده.")
+    return {"X-Api-Key": FASTSAVER_API_KEY, "Accept": "application/json"}
+
+
+def fastsaver_error(response: httpx.Response, data: Any = None) -> RuntimeError:
+    detail = None
+    if isinstance(data, dict):
+        detail = data.get("detail") or data.get("error") or data.get("message")
+    if not detail:
+        detail = (response.text or f"HTTP {response.status_code}")[:500]
+    return RuntimeError(f"FastSaver HTTP {response.status_code}: {detail}")
+
+
+def fastsaver_youtube_info_sync(url: str) -> dict[str, Any]:
+    with httpx.Client(timeout=60, follow_redirects=True) as client:
+        r = client.get(f"{FASTSAVER_BASE_URL}/youtube/info", params={"url": url}, headers=fastsaver_headers())
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+        if r.status_code >= 400 or not isinstance(data, dict) or not data.get("ok"):
+            raise fastsaver_error(r, data)
+        return data
+
+
+def analyze_youtube_fastsaver(url: str) -> dict[str, Any]:
+    info = fastsaver_youtube_info_sync(url)
+    formats = info.get("formats") or []
+    qualities: list[int] = []
+    size_map: dict[str, int] = {}
+    for f in formats:
+        if f.get("type") != "video":
+            continue
+        fmt = str(f.get("format") or "")
+        m = re.fullmatch(r"(\d+)p", fmt)
+        if not m:
+            continue
+        q = int(m.group(1))
+        qualities.append(q)
+        try:
+            size_map[str(q)] = int(f.get("filesize") or 0)
+        except Exception:
+            pass
+    qualities = sorted(set(qualities), reverse=True)
+    safe_limit = MAX_SEND_MB * 1024 * 1024
+    safe_qualities = [q for q in qualities if not size_map.get(str(q)) or size_map.get(str(q), 0) <= safe_limit]
+    if safe_qualities:
+        qualities = safe_qualities
+    return {
+        "platform":"youtube", "kind":"video", "url":url,
+        "title":str(info.get("title") or "YouTube video")[:180],
+        "owner":info.get("author") or "YouTube",
+        "thumbnail":info.get("thumbnail") or (info.get("thumbnails") or {}).get("max"),
+        "media":[{
+            "type":"video", "qualities":qualities[:8], "display_url":info.get("thumbnail"),
+            "playlist_index":1, "title":str(info.get("title") or "YouTube video")[:180],
+            "has_audio":True, "duration":info.get("duration"), "id":info.get("video_id"),
+            "filesizes":size_map,
+        }],
+        "provider":"fastsaver",
+    }
+
+
+async def fastsaver_json(method: str, path: str, *, params: dict[str, Any] | None = None, payload: dict[str, Any] | None = None, timeout: int | None = None) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=timeout or FASTSAVER_TIMEOUT, follow_redirects=True) as client:
+        r = await client.request(method, f"{FASTSAVER_BASE_URL}{path}", params=params, json=payload, headers=fastsaver_headers())
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+        if r.status_code >= 400 or not isinstance(data, dict) or not data.get("ok"):
+            raise fastsaver_error(r, data)
+        return data
+
+
+async def fastsaver_youtube_download(url: str, quality: str, outdir: Path) -> Path:
+    fmt = f"{quality}p" if quality.isdigit() else "720p"
+    data = await fastsaver_json("POST", "/youtube/download", payload={"url":url, "format":fmt}, timeout=FASTSAVER_TIMEOUT)
+    dl_url = data.get("download_url")
+    if not dl_url:
+        raise RuntimeError("FastSaver لینک دانلود برنگرداند.")
+    filename = str(data.get("filename") or f"youtube_{data.get('video_id','video')}_{fmt}.mp4")
+    filename = re.sub(r"[^A-Za-z0-9._ -]+", "_", filename).strip(" .")[:180] or "youtube.mp4"
+    if not Path(filename).suffix:
+        filename += ".mp4"
+    dest = outdir / filename
+    await download_url(str(dl_url), dest)
+    return dest
+
+
+async def fastsaver_search_music(query: str) -> dict[str, Any]:
+    data = await fastsaver_json("GET", "/youtube/search", params={"query":query, "page":1}, timeout=90)
+    results = [x for x in (data.get("results") or []) if isinstance(x, dict) and x.get("video_id")]
+    if not results:
+        raise RuntimeError("FastSaver/YouTube Music نتیجه‌ای برای این آهنگ پیدا نکرد.")
+    return results[0]
+
+
+async def ensure_bot_username() -> str:
+    global FASTSAVER_BOT_USERNAME
+    if FASTSAVER_BOT_USERNAME:
+        return FASTSAVER_BOT_USERNAME if FASTSAVER_BOT_USERNAME.startswith("@") else "@" + FASTSAVER_BOT_USERNAME
+    me = await tg("getMe", {})
+    username = (me or {}).get("username")
+    if not username:
+        raise RuntimeError("Username بات از Telegram دریافت نشد؛ FASTSAVER_BOT_USERNAME را تنظیم کن.")
+    FASTSAVER_BOT_USERNAME = "@" + username
+    return FASTSAVER_BOT_USERNAME
+
+
+async def fastsaver_audio_file_id(video_id: str, cache_key: str, title: str, platform: str) -> str:
+    cached = get_cached_file_id(cache_key)
+    if cached:
+        log.info("fastsaver: Telegram file_id cache hit key=%s", cache_key)
+        return cached
+    bot_username = await ensure_bot_username()
+    data = await fastsaver_json("POST", "/youtube/audio/tg-bot", payload={"video_id":video_id, "bot_username":bot_username}, timeout=FASTSAVER_TIMEOUT)
+    file_id = data.get("file_id")
+    if not file_id:
+        raise RuntimeError("FastSaver Telegram file_id برنگرداند.")
+    set_cached_file_id(cache_key, str(file_id), title, platform)
+    return str(file_id)
+
+
+async def send_audio_file_id(chat_id: int, file_id: str, caption: str) -> None:
+    await tg("sendAudio", {"chat_id":str(chat_id), "audio":file_id, "caption":caption, "parse_mode":"HTML"})
+
+
 def spotify_oembed_sync(url: str) -> dict[str, Any]:
     """Fetch lightweight public metadata using Spotify's oEmbed endpoint."""
     try:
@@ -389,7 +540,9 @@ def analyze_sync(url: str) -> dict[str, Any]:
         if kind == "post": return analyze_instagram_post(url)
         if kind in {"story","highlight"}: return analyze_generic_ydl(url, "instagram", kind)
         return analyze_generic_ydl(url, "instagram", "media")
-    if platform in {"youtube","twitter","soundcloud"}:
+    if platform == "youtube":
+        return analyze_youtube_fastsaver(url)
+    if platform in {"twitter","soundcloud"}:
         return analyze_generic_ydl(url, platform)
     raise ValueError("لینک باید از Instagram، YouTube، X/Twitter، SoundCloud یا Spotify باشد.")
 
@@ -485,10 +638,13 @@ def build_keyboard(result: dict[str, Any], job_id: str) -> dict:
             else:
                 rows.append([{"text":f"🎬 ویدیو{title_idx} · Best","callback_data":f"d|{job_id}|v|{idx}|b"}])
             if item.get("has_audio"):
-                rows.append([
-                    {"text":f"🎧 MP3 128{title_idx}","callback_data":f"a|{job_id}|{idx}|128"},
-                    {"text":"🎧 MP3 320","callback_data":f"a|{job_id}|{idx}|320"},
-                ])
+                if platform == "youtube":
+                    rows.append([{"text":f"🎧 دانلود صوت{title_idx}","callback_data":f"a|{job_id}|{idx}|128"}])
+                else:
+                    rows.append([
+                        {"text":f"🎧 MP3 128{title_idx}","callback_data":f"a|{job_id}|{idx}|128"},
+                        {"text":"🎧 MP3 320","callback_data":f"a|{job_id}|{idx}|320"},
+                    ])
     if len(result["media"]) > 1:
         rows.append([{"text":"📥 دانلود همه · Best","callback_data":f"all|{job_id}"}])
     return {"inline_keyboard":rows}
@@ -513,7 +669,7 @@ def result_text(result: dict[str, Any]) -> str:
            f"👤 {html.escape(str(result.get('owner') or label))}"]
     if platform=="spotify":
         kind=result.get("kind","track").title()
-        lines += [f"📦 نوع: <b>{kind}</b>","",f"🎵 خروجی: MP3 · هدف {html.escape(SPOTIFY_BITRATE)}","انتخاب کن 👇"]
+        lines += [f"📦 نوع: <b>{kind}</b>","","🎵 خروجی: Telegram Audio · FastSaver","انتخاب کن 👇"]
         return "\n".join(lines)
     lines.append(f"📦 {len(media)} آیتم · 🖼 {counts['image']} · 🎬 {counts['video']} · 🎵 {counts['audio']}")
     lines.append("")
@@ -636,6 +792,9 @@ async def prepare_media(job: dict[str,Any], idx: int, quality: str, mode: str, t
     if mode=="audio" or item["type"]=="audio":
         path=await asyncio.to_thread(download_audio_sync,job["source_url"],playlist_index,quality,tmp,platform)
         return path,"audio",f"MP3 {quality}k"
+    if platform=="youtube":
+        path=await fastsaver_youtube_download(job["source_url"],quality,tmp)
+        return path,"video",(f"{quality}p" if quality.isdigit() else "720p")
     path=await asyncio.to_thread(download_video_sync,job["source_url"],playlist_index,quality,tmp,platform)
     return path,"video",(f"{quality}p" if quality.isdigit() else "Best")
 
@@ -656,35 +815,58 @@ async def send_file(chat_id:int,path:Path,kind:str,caption:str) -> bool:
 
 
 async def send_one(job:dict[str,Any],user_id:int,chat_id:int,idx:int,quality:str,mode:str):
-    tmp=Path(tempfile.mkdtemp(prefix="bluegate_v3_"))
+    platform=job["result"].get("platform","generic")
+    if platform=="youtube" and mode=="audio":
+        try:
+            item=job["result"]["media"][idx]
+            video_id=str(item.get("id") or "")
+            if not video_id:
+                raise RuntimeError("YouTube video_id پیدا نشد.")
+            await send_text(chat_id,"🎧 دارم نسخه صوتی رو از FastSaver آماده می‌کنم…")
+            bot_username=(await ensure_bot_username()).lower()
+            cache_key=f"youtube:{video_id}:{bot_username}"
+            file_id=await fastsaver_audio_file_id(video_id,cache_key,job["result"].get("title","") or "", "youtube")
+            await send_audio_file_id(chat_id,file_id,f"{html.escape(BRAND_NAME)} · YouTube · Audio")
+            record_download(user_id,job["job_id"],"audio","FastSaver TG file_id",0,"youtube")
+        except Exception as exc:
+            log.exception("youtube FastSaver audio failed")
+            await send_text(chat_id,"❌ دانلود صوت YouTube ناموفق بود.\n\n<code>"+html.escape(str(exc))[:900]+"</code>")
+        return
+    tmp=Path(tempfile.mkdtemp(prefix="bluegate_v4_"))
     try:
         await send_text(chat_id,f"⬇️ آیتم <b>{idx+1}</b> در حال آماده‌سازی…")
         path,kind,qlabel=await prepare_media(job,idx,quality,mode,tmp)
-        platform=job["result"].get("platform","generic")
         ok=await send_file(chat_id,path,kind,f"{html.escape(BRAND_NAME)} · {PLATFORM_LABELS.get(platform,platform)} · {qlabel}")
         if ok: record_download(user_id,job["job_id"],kind,qlabel,path.stat().st_size,platform)
+    except Exception as exc:
+        log.exception("send_one failed")
+        await send_text(chat_id,"❌ دانلود ناموفق بود.\n\n<code>"+html.escape(str(exc))[:900]+"</code>")
     finally: shutil.rmtree(tmp,ignore_errors=True)
 
 
 async def send_spotify(job:dict[str,Any],user_id:int,chat_id:int):
-    tmp=Path(tempfile.mkdtemp(prefix="bluegate_spotify_"))
     try:
-        log.info("spotify-lite: job=%s started", job.get("job_id"))
-        await send_text(chat_id,"🟢 Spotify شناسایی شد؛ دارم ترک متناظر رو پیدا و MP3 رو آماده می‌کنم…")
-        files=await asyncio.to_thread(download_spotify_sync,job["source_url"],tmp)
-        sent=0
-        for p in files:
-            log.info("spotify-lite: sending %s (%d bytes)", p.name, p.stat().st_size)
-            ok=await send_file(chat_id,p,"audio",f"{html.escape(BRAND_NAME)} · Spotify · MP3")
-            if ok:
-                sent+=1; record_download(user_id,job["job_id"],"audio",f"MP3 {SPOTIFY_BITRATE}",p.stat().st_size,"spotify")
-        if sent:
-            await send_text(chat_id,"✅ Spotify Track ارسال شد.")
+        m = SPOTIFY_RE.search(job["source_url"])
+        if not m or m.group(1).lower() != "track":
+            raise RuntimeError("فعلاً در V4 فقط Spotify Track تکی پشتیبانی می‌شود.")
+        track_id = m.group(2)
+        await send_text(chat_id,"🟢 Spotify شناسایی شد؛ دارم ترک رو در YouTube Music پیدا می‌کنم…")
+        meta = await asyncio.to_thread(spotify_oembed_sync, job["source_url"])
+        title = str(meta.get("title") or job["result"].get("title") or "").strip()
+        artist = str(meta.get("author_name") or "").strip()
+        if not title:
+            raise RuntimeError("عنوان ترک Spotify پیدا نشد.")
+        query = f"{artist} - {title}" if artist and artist.lower() not in title.lower() else title
+        result = await fastsaver_search_music(query)
+        video_id = str(result["video_id"])
+        cache_key = f"spotify:{track_id}:{(await ensure_bot_username()).lower()}"
+        file_id = await fastsaver_audio_file_id(video_id, cache_key, title, "spotify")
+        await send_audio_file_id(chat_id, file_id, f"{html.escape(BRAND_NAME)} · Spotify · {html.escape(title)[:120]}")
+        record_download(user_id,job["job_id"],"audio","FastSaver TG file_id",0,"spotify")
+        await send_text(chat_id,"✅ Spotify Track ارسال شد.")
     except Exception as exc:
-        log.exception("spotify-lite failed")
+        log.exception("spotify-fastsaver failed")
         await send_text(chat_id,"❌ دانلود Spotify ناموفق بود.\n\n<code>"+html.escape(str(exc))[:900]+"</code>")
-    finally:
-        shutil.rmtree(tmp,ignore_errors=True)
 
 
 async def send_all(job:dict[str,Any],user_id:int,chat_id:int):
@@ -716,7 +898,7 @@ def admin_keyboard() -> dict:
 
 async def send_admin_panel(chat_id:int):
     s=stats(); gb=s["bytes"]/(1024**3)
-    lines=["🛠 <b>BlueGate Downloader V3</b>","",f"👥 کاربران: <b>{s['users']}</b>",f"🟢 فعال ۲۴ ساعت: <b>{s['active24']}</b>",
+    lines=["🛠 <b>BlueGate Downloader V4</b>","",f"👥 کاربران: <b>{s['users']}</b>",f"🟢 فعال ۲۴ ساعت: <b>{s['active24']}</b>",
            f"📥 کل دانلودها: <b>{s['downloads']}</b>",f"⚡ دانلود ۲۴ ساعت: <b>{s['downloads24']}</b>",f"💾 حجم ارسال‌شده: <b>{gb:.2f} GB</b>","","📊 <b>پلتفرم‌ها</b>"]
     for p,c in s["platforms"][:8]: lines.append(f"• {PLATFORM_LABELS.get(p,p)}: <b>{c}</b>")
     await send_text(chat_id,"\n".join(lines),admin_keyboard())
@@ -725,10 +907,10 @@ async def send_admin_panel(chat_id:int):
 HELP_TEXT=(
     "لینک یکی از این سرویس‌ها رو بفرست 👇\n\n"
     "📸 <b>Instagram</b> — Post / Reel / Carousel / Story / Highlight\n"
-    "▶️ <b>YouTube</b> — Video / Shorts / Playlist + MP3\n"
+    "▶️ <b>YouTube</b> — Video / Shorts + Audio (FastSaver API)\n"
     "𝕏 <b>X / Twitter</b> — Video / GIF / media\n"
     "☁️ <b>SoundCloud</b> — Track / set + MP3\n"
-    "🟢 <b>Spotify</b> — Track / Album / Playlist → matched audio + metadata\n\n"
+    "🟢 <b>Spotify</b> — Track → YouTube Music match + Telegram audio\n\n"
     f"📦 حداکثر آیتم Playlist در هر درخواست: <b>{MAX_PLAYLIST_ITEMS}</b>\n"
     "فقط محتوایی رو دانلود کن که اجازه ذخیره/استفاده ازش رو داری."
 )
@@ -739,7 +921,7 @@ async def handle_message(message:dict[str,Any]):
     text=message.get("text") or message.get("caption") or ""
     if text.startswith("/start") or text.startswith("/help"):
         if not await ensure_joined(user_id,chat_id): return
-        await send_text(chat_id,f"سلام 👋\nبه <b>{html.escape(BRAND_NAME)} V3</b> خوش اومدی.\n\n{HELP_TEXT}"+(f"\n\n🆘 @{html.escape(SUPPORT_USERNAME)}" if SUPPORT_USERNAME else ""))
+        await send_text(chat_id,f"سلام 👋\nبه <b>{html.escape(BRAND_NAME)} V4</b> خوش اومدی.\n\n{HELP_TEXT}"+(f"\n\n🆘 @{html.escape(SUPPORT_USERNAME)}" if SUPPORT_USERNAME else ""))
         return
     if text.startswith("/admin") or text.startswith("/stats"):
         if user_id in ADMIN_IDS: await send_admin_panel(chat_id)
@@ -751,15 +933,15 @@ async def handle_message(message:dict[str,Any]):
         await send_text(chat_id,HELP_TEXT); return
     platform=detect_platform(url)
     if platform=="generic":
-        await send_text(chat_id,"❌ این دامنه فعلاً در V3 فعال نیست. Instagram / YouTube / X / SoundCloud / Spotify رو بفرست."); return
+        await send_text(chat_id,"❌ این دامنه فعلاً در V4 فعال نیست. Instagram / YouTube / X / SoundCloud / Spotify رو بفرست."); return
     status=await send_text(chat_id,f"{PLATFORM_ICONS.get(platform,'🌐')} دارم لینک {PLATFORM_LABELS.get(platform,platform)} رو آنالیز می‌کنم…")
     try:
         result=await analyze(url); job_id=save_job(user_id,chat_id,url,result)
         await edit_text(chat_id,status["message_id"],result_text(result),build_keyboard(result,job_id))
     except Exception as exc:
         log.exception("analyze failed")
-        hints={"instagram":"اگر محتوا Private/Story باشه ممکنه Cookie لازم باشه.","youtube":"بعضی ویدیوها Login/Cookie یا محدودیت منطقه‌ای دارند.",
-               "soundcloud":"SoundCloud گاهی extractor را موقتاً محدود می‌کند.","spotify":"Spotify/spotDL ممکنه به تغییرات API یا محدودیت منبع صوتی بخوره."}
+        hints={"instagram":"اگر محتوا Private/Story باشه ممکنه Cookie لازم باشه.","youtube":"YouTube در V4 از FastSaver API استفاده می‌کند؛ API key و اعتبار حساب را بررسی کن.",
+               "soundcloud":"SoundCloud گاهی extractor را موقتاً محدود می‌کند.","spotify":"Spotify در V4 از FastSaver + YouTube Music استفاده می‌کند؛ فعلاً Track تکی پشتیبانی می‌شود."}
         await edit_text(chat_id,status["message_id"],f"❌ نتونستم لینک رو بخونم.\n\n💡 {hints.get(platform,'')}\n\n<code>{html.escape(str(exc))[:500]}</code>")
 
 
@@ -822,15 +1004,20 @@ async def startup():
             await tg("setWebhook",{"url":f"{WEBHOOK_URL}/telegram/{WEBHOOK_SECRET}","secret_token":WEBHOOK_SECRET,
                                    "allowed_updates":json.dumps(["message","callback_query"]),"drop_pending_updates":"false"})
             log.info("Webhook configured")
+            try:
+                await ensure_bot_username()
+                log.info("FastSaver bot username resolved: %s", FASTSAVER_BOT_USERNAME)
+            except Exception as exc:
+                log.warning("Could not resolve bot username at startup: %s", exc)
         except Exception: log.exception("Webhook setup failed")
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
-async def root(): return PlainTextResponse(f"{BRAND_NAME} V3 is running ✅")
+async def root(): return PlainTextResponse(f"{BRAND_NAME} V4 is running ✅")
 
 
 @app.get("/health")
-async def health(): return JSONResponse({"ok":True,"version":"3.3","platforms":["instagram","youtube","twitter","soundcloud","spotify"]})
+async def health(): return JSONResponse({"ok":True,"version":"4.0","platforms":["instagram","youtube","twitter","soundcloud","spotify"],"youtube_provider":"FastSaverAPI","spotify_provider":"FastSaverAPI"})
 
 
 @app.post("/telegram/{secret}")

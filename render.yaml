@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: bluegate-multi-downloader-v3
+    name: bluegate-multi-downloader-v4
     runtime: docker
     plan: free
     healthCheckPath: /health
@@ -11,6 +11,12 @@ services:
         sync: false
       - key: WEBHOOK_SECRET
         generateValue: true
+      - key: FASTSAVER_API_KEY
+        sync: false
+      - key: FASTSAVER_BASE_URL
+        value: "https://api.fastsaver.io/v1"
+      - key: FASTSAVER_TIMEOUT
+        value: "300"
       - key: MAX_SEND_MB
         value: "49"
       - key: MAX_PLAYLIST_ITEMS
@@ -27,7 +33,3 @@ services:
         value: "12"
       - key: SPOTIFY_ENABLED
         value: "true"
-      - key: YOUTUBE_COOKIES_B64
-        sync: false
-      - key: SPOTIFY_BITRATE
-        value: "128k"

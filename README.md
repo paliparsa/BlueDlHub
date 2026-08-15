@@ -1,48 +1,48 @@
-# BlueGate Downloader V3.3 — YouTube PO Token Edition
+# BlueGate Downloader V4 — Hybrid API Edition
 
-V3.3 keeps the V3.2 Telegram downloader and adds an automatic YouTube PO-token provider for Render/datacenter IPs.
+V4 keeps the working direct extractors for Instagram, X/Twitter and SoundCloud, and moves only YouTube + Spotify to FastSaverAPI.
 
-## Supported platforms
-- Instagram
-- YouTube / YouTube Music
-- X / Twitter
-- SoundCloud
-- Spotify Track (resolved through the hardened YouTube engine)
+## Routing
 
-## What changed in V3.3
-- `bgutil-ytdlp-pot-provider` 1.3.1 installed as a yt-dlp plugin.
-- A local BgUtils provider starts inside the same Render container on `127.0.0.1:4416`.
-- YouTube extraction defaults to the `mweb` client with automatic PO tokens.
-- YouTube tries three strategies: `mweb+POT+cookies`, `mweb+POT guest`, then legacy cookies.
-- Spotify Lite uses the same hardened YouTube engine.
-- `httpx` request logging is reduced so Telegram bot tokens are not printed in ordinary INFO logs.
-- Render health-check `HEAD /` remains supported.
+- Instagram -> Instaloader / yt-dlp (direct)
+- X / Twitter -> yt-dlp (direct)
+- SoundCloud -> yt-dlp (direct)
+- YouTube -> FastSaverAPI (`/youtube/info`, `/youtube/download`, `/youtube/audio/tg-bot`)
+- Spotify Track -> Spotify oEmbed metadata -> FastSaver YouTube Music search -> FastSaver Telegram `file_id`
 
-## Render deployment
-Replace the files in the existing GitHub repository with the contents of this folder and deploy the latest commit. Keep your existing environment variables.
+Spotify Album/Playlist are intentionally not enabled in V4.0; only individual Track links are supported.
 
-Recommended environment variables:
+## Render setup
 
-```env
+Required Environment variables:
+
+```text
 BOT_TOKEN=...
 WEBHOOK_URL=https://YOUR-SERVICE.onrender.com
-WEBHOOK_SECRET=...
-ADMIN_IDS=...
-YOUTUBE_COOKIES_B64=...
-YOUTUBE_POT_ENABLED=true
-YOUTUBE_POT_BASE_URL=http://127.0.0.1:4416
-YOUTUBE_PLAYER_CLIENT=mweb
-SPOTIFY_ENABLED=true
-SPOTIFY_BITRATE=128k
+WEBHOOK_SECRET=some-long-random-value
+FASTSAVER_API_KEY=fs_sk_...
 ```
 
-Do not upload `cookies.txt`, bot tokens, or secrets to GitHub.
+Optional:
 
-## Expected startup clues
-The Render log should show the BgUtils provider starting before Uvicorn. During a YouTube/Spotify request, application logs use markers such as:
+```text
+ADMIN_IDS=123456789
+BRAND_NAME=BlueGate Downloader
+SUPPORT_USERNAME=BlueGateSupport
+FASTSAVER_BOT_USERNAME=@YourBotUsername
+MAX_SEND_MB=49
+```
 
-- `youtube-engine: metadata attempt=mweb+pot+cookies`
-- `spotify-lite: YouTube attempt=mweb+pot+cookies`
-- fallback to `mweb+pot+guest` if necessary
+`FASTSAVER_BOT_USERNAME` is optional. If omitted, the bot calls Telegram `getMe` on startup and resolves it automatically.
 
-Providing PO tokens improves compatibility with YouTube challenges but cannot guarantee every datacenter IP will be accepted by YouTube.
+## Important V4 behavior
+
+YouTube metadata/quality selection no longer uses yt-dlp, cookies or PO tokens. The bot asks FastSaver `/youtube/info` for the actual formats and then `/youtube/download` for the selected resolution.
+
+YouTube audio and Spotify Track delivery use FastSaver `/youtube/audio/tg-bot`, which returns a Telegram `file_id` scoped to your bot. V4 caches that file_id in SQLite, so repeated sends of the same resolved track do not consume another FastSaver call while the Render database survives.
+
+On Render Free, `/tmp` is ephemeral; cache and statistics reset when the instance is recreated/redeployed.
+
+## Deploy
+
+Put these files directly in the GitHub repository root, commit, and let Render redeploy the Docker service.
