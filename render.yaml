@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: insta-telegram-downloader
+    name: bluegate-insta-downloader-v2
     runtime: docker
     plan: free
     healthCheckPath: /health
@@ -13,3 +13,13 @@ services:
         generateValue: true
       - key: MAX_SEND_MB
         value: "49"
+      - key: BRAND_NAME
+        value: "BlueGate Downloader"
+      - key: SUPPORT_USERNAME
+        value: "BlueGateSupport"
+      - key: ADMIN_IDS
+        sync: false
+      - key: DB_PATH
+        value: "/tmp/instabot.db"
+      - key: JOB_TTL_HOURS
+        value: "12"
