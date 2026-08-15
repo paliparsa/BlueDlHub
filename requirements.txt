@@ -3,4 +3,3 @@ uvicorn[standard]==0.23.2
 httpx==0.28.1
 instaloader>=4.14
 yt-dlp[default]==2026.7.4
-spotdl==4.5.2

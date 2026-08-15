@@ -8,7 +8,7 @@ A Telegram webhook bot that auto-detects supported links and offers the appropri
 - YouTube — Videos, Shorts, playlists; video quality + MP3 extraction
 - X / Twitter — video/GIF/media supported by yt-dlp
 - SoundCloud — tracks/sets supported by yt-dlp; MP3 output
-- Spotify — Track / Album / Playlist through spotDL (Spotify metadata + matched audio source)
+- Spotify — Track / Album / Playlist through Spotify Lite resolver (Spotify metadata + matched audio source)
 
 ## V3 highlights
 
@@ -24,7 +24,7 @@ A Telegram webhook bot that auto-detects supported links and offers the appropri
 
 ## Important Spotify note
 
-Spotify itself is not being decrypted or ripped. spotDL uses Spotify links/metadata and finds a matching audio source (normally YouTube Music), then writes Spotify metadata/artwork to the output. Actual source quality can be lower than an MP3 target bitrate. spotDL's current docs state the normal source ceiling is around 128 kbps unless an eligible YouTube Music Premium setup is used.
+Spotify itself is not being decrypted or ripped. Spotify Lite resolver uses Spotify links/metadata and finds a matching audio source (normally YouTube Music), then writes Spotify metadata/artwork to the output. Actual source quality can be lower than an MP3 target bitrate. Spotify Lite resolver's current docs state the normal source ceiling is around 128 kbps unless an eligible YouTube Music Premium setup is used.
 
 ## Commands
 
@@ -81,4 +81,4 @@ YouTube video merging, MP3 transcoding and Spotify matching can use much more CP
 
 ## Legal / usage
 
-Use the bot only for media you have the right or permission to download and reuse. Some services may require account cookies for content you are authorized to access. Platform changes can temporarily break extractors; keeping yt-dlp/spotDL current is important.
+Use the bot only for media you have the right or permission to download and reuse. Some services may require account cookies for content you are authorized to access. Platform changes can temporarily break extractors; keeping yt-dlp/Spotify Lite resolver current is important.

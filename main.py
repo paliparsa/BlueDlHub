@@ -313,6 +313,19 @@ def analyze_generic_ydl(url: str, platform: str, kind: str | None = None) -> dic
             "media":media}
 
 
+def spotify_oembed_sync(url: str) -> dict[str, Any]:
+    """Fetch lightweight public metadata using Spotify's oEmbed endpoint."""
+    try:
+        with httpx.Client(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0"}) as client:
+            r = client.get("https://open.spotify.com/oembed", params={"url": url})
+            r.raise_for_status()
+            data = r.json()
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        log.warning("spotify oEmbed failed: %s", exc)
+        return {}
+
+
 def analyze_spotify(url: str) -> dict[str, Any]:
     if not SPOTIFY_ENABLED:
         raise RuntimeError("Spotify downloader غیرفعال است.")
@@ -320,8 +333,11 @@ def analyze_spotify(url: str) -> dict[str, Any]:
     if not m:
         raise ValueError("فعلاً لینک‌های open.spotify.com برای Track / Album / Playlist پشتیبانی می‌شوند.")
     kind = m.group(1).lower()
-    title = {"track":"Spotify Track","album":"Spotify Album","playlist":"Spotify Playlist"}[kind]
-    return {"platform":"spotify","kind":kind,"url":url,"title":title,"owner":"Spotify metadata",
+    meta = spotify_oembed_sync(url)
+    title = (meta.get("title") or {"track":"Spotify Track","album":"Spotify Album","playlist":"Spotify Playlist"}[kind])[:180]
+    thumb = meta.get("thumbnail_url")
+    return {"platform":"spotify","kind":kind,"url":url,"title":title,"owner":"Spotify",
+            "thumbnail":thumb,
             "media":[{"type":"spotify","title":title,"playlist_index":1,"qualities":[]}]}
 
 
@@ -516,20 +532,59 @@ def download_audio_sync(source_url: str, playlist_index: int, bitrate: str, outd
 
 
 def download_spotify_sync(source_url: str, outdir: Path) -> list[Path]:
-    cmd=[sys.executable,"-m","spotdl","download",source_url,"--output",str(outdir/"{artist} - {title}.{output-ext}"),
-         "--format","mp3","--bitrate",SPOTIFY_BITRATE]
-    cookie = YOUTUBE_COOKIE_FILE or COOKIE_FILE
-    if cookie and Path(cookie).exists():
-        cmd.extend(["--cookie-file", cookie])
-    proc=subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
-    output = (proc.stdout or "").strip()
-    if proc.returncode!=0:
-        raise RuntimeError("spotDL/YouTube failed:\n" + output[-1600:])
-    files=sorted([p for p in outdir.rglob("*.mp3") if p.is_file()], key=lambda p:p.stat().st_mtime)
+    """Resolve a Spotify track via public oEmbed metadata and download a matching audio source with yt-dlp.
+
+    This intentionally avoids spawning spotDL on small Render instances.
+    """
+    m = SPOTIFY_RE.search(source_url)
+    if not m:
+        raise RuntimeError("لینک Spotify معتبر نیست.")
+    kind = m.group(1).lower()
+    if kind != "track":
+        raise RuntimeError("در حالت Spotify Lite فعلاً دانلود مستقیم Track فعال است؛ Album/Playlist را در نسخه بعدی صف‌بندی می‌کنیم.")
+
+    log.info("spotify-lite: fetching oEmbed metadata")
+    meta = spotify_oembed_sync(source_url)
+    title = (meta.get("title") or "").strip()
+    if not title:
+        raise RuntimeError("Spotify metadata پیدا نشد؛ لینک را دوباره بررسی کن.")
+
+    # Spotify's oEmbed title is enough to form a search query; prefer official/audio matches.
+    query = f"ytsearch3:{title} official audio"
+    log.info("spotify-lite: searching YouTube for %r", title)
+    opts = ydl_options(False, "youtube")
+    opts.update({
+        "outtmpl": str(outdir/"%(title).140B.%(ext)s"),
+        "restrictfilenames": True,
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "playlistend": 3,
+        "postprocessors": [{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":SPOTIFY_BITRATE.rstrip("k")}],
+    })
+    before=set(outdir.rglob("*"))
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+            entries = [e for e in (info or {}).get("entries", []) if e]
+            if not entries:
+                raise RuntimeError("هیچ نتیجه‌ای در YouTube برای این ترک پیدا نشد.")
+            # Download the first result returned by yt-dlp search.
+            chosen = entries[0]
+            chosen_url = chosen.get("webpage_url") or chosen.get("url")
+            if not chosen_url:
+                raise RuntimeError("نتیجه YouTube URL قابل دانلود نداشت.")
+            log.info("spotify-lite: downloading matched source id=%s title=%r", chosen.get("id"), chosen.get("title"))
+            ydl.extract_info(chosen_url, download=True)
+    except Exception as exc:
+        raise RuntimeError(f"Spotify Lite / YouTube failed: {exc}") from exc
+
+    files=[p for p in outdir.rglob("*.mp3") if p.is_file() and p not in before]
     if not files:
-        hint = output[-1600:] if output else "No output from spotDL."
-        raise RuntimeError("spotDL خروجی صوتی نساخت. علت احتمالی خطای YouTube/YouTube Music است:\n" + hint)
-    return files[:MAX_PLAYLIST_ITEMS]
+        files=[p for p in outdir.rglob("*.mp3") if p.is_file()]
+    if not files:
+        raise RuntimeError("YouTube دانلود شد ولی خروجی MP3 ساخته نشد؛ FFmpeg/format را بررسی کن.")
+    log.info("spotify-lite: mp3 ready %s", files[0].name)
+    return [max(files, key=lambda p:p.stat().st_mtime)]
 
 
 async def prepare_media(job: dict[str,Any], idx: int, quality: str, mode: str, tmp: Path) -> tuple[Path,str,str]:
@@ -574,15 +629,22 @@ async def send_one(job:dict[str,Any],user_id:int,chat_id:int,idx:int,quality:str
 async def send_spotify(job:dict[str,Any],user_id:int,chat_id:int):
     tmp=Path(tempfile.mkdtemp(prefix="bluegate_spotify_"))
     try:
-        await send_text(chat_id,"🟢 Spotify شناسایی شد؛ دارم ترک متناظر + متادیتا رو آماده می‌کنم…")
+        log.info("spotify-lite: job=%s started", job.get("job_id"))
+        await send_text(chat_id,"🟢 Spotify شناسایی شد؛ دارم ترک متناظر رو پیدا و MP3 رو آماده می‌کنم…")
         files=await asyncio.to_thread(download_spotify_sync,job["source_url"],tmp)
         sent=0
         for p in files:
+            log.info("spotify-lite: sending %s (%d bytes)", p.name, p.stat().st_size)
             ok=await send_file(chat_id,p,"audio",f"{html.escape(BRAND_NAME)} · Spotify · MP3")
             if ok:
                 sent+=1; record_download(user_id,job["job_id"],"audio",f"MP3 {SPOTIFY_BITRATE}",p.stat().st_size,"spotify")
-        if len(files)>1: await send_text(chat_id,f"✅ <b>{sent}</b> فایل Spotify ارسال شد.")
-    finally: shutil.rmtree(tmp,ignore_errors=True)
+        if sent:
+            await send_text(chat_id,"✅ Spotify Track ارسال شد.")
+    except Exception as exc:
+        log.exception("spotify-lite failed")
+        await send_text(chat_id,"❌ دانلود Spotify ناموفق بود.\n\n<code>"+html.escape(str(exc))[:900]+"</code>")
+    finally:
+        shutil.rmtree(tmp,ignore_errors=True)
 
 
 async def send_all(job:dict[str,Any],user_id:int,chat_id:int):
@@ -728,7 +790,7 @@ async def root(): return PlainTextResponse(f"{BRAND_NAME} V3 is running ✅")
 
 
 @app.get("/health")
-async def health(): return JSONResponse({"ok":True,"version":"3.1","platforms":["instagram","youtube","twitter","soundcloud","spotify"]})
+async def health(): return JSONResponse({"ok":True,"version":"3.2","platforms":["instagram","youtube","twitter","soundcloud","spotify"]})
 
 
 @app.post("/telegram/{secret}")
