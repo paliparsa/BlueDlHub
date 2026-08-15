@@ -63,7 +63,7 @@ if not BOT_TOKEN:
     log.warning("BOT_TOKEN is not set")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-app = FastAPI(title="BlueGate Multi Downloader V3")
+app = FastAPI(title="BlueGate Multi Downloader V3.1")
 loader = instaloader.Instaloader(download_pictures=False, download_videos=False, save_metadata=False, quiet=True)
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
@@ -349,6 +349,19 @@ async def tg(method: str, data: dict[str, Any] | None = None, files=None):
         except Exception: raise RuntimeError(f"Telegram HTTP {r.status_code}: {r.text[:500]}")
         if not payload.get("ok"): raise RuntimeError(payload.get("description", "Telegram API error"))
         return payload.get("result")
+
+
+async def safe_answer_callback(callback_query_id: str, text: str | None = None, show_alert: bool = False):
+    """Best-effort callback acknowledgement. Never abort the actual download flow."""
+    data = {"callback_query_id": callback_query_id}
+    if text:
+        data["text"] = text[:180]
+    if show_alert:
+        data["show_alert"] = "true"
+    try:
+        await tg("answerCallbackQuery", data)
+    except Exception as exc:
+        log.warning("answerCallbackQuery ignored: %s", exc)
 
 
 async def send_text(chat_id: int, text: str, reply_markup: dict | None = None):
@@ -653,14 +666,14 @@ async def handle_callback(cb:dict[str,Any]):
     user=cb.get("from",{}); user_id=user.get("id"); data=cb.get("data",""); upsert_user(user)
     if data=="joincheck":
         if await is_joined(user_id):
-            await tg("answerCallbackQuery",{"callback_query_id":cb_id,"text":"عضویت تأیید شد ✅"})
+            await safe_answer_callback(cb_id,"عضویت تأیید شد ✅")
             if chat_id: await send_text(chat_id,"✅ عضویت تأیید شد. حالا لینک رو بفرست.")
-        else: await tg("answerCallbackQuery",{"callback_query_id":cb_id,"text":"هنوز عضویت تأیید نشده.","show_alert":"true"})
+        else: await safe_answer_callback(cb_id,"هنوز عضویت تأیید نشده.",True)
         return
     if data.startswith("adm|"):
         if user_id not in ADMIN_IDS:
-            await tg("answerCallbackQuery",{"callback_query_id":cb_id,"text":"Access denied","show_alert":"true"}); return
-        action=data.split("|",1)[1]; await tg("answerCallbackQuery",{"callback_query_id":cb_id})
+            await safe_answer_callback(cb_id,"Access denied",True); return
+        action=data.split("|",1)[1]; await safe_answer_callback(cb_id)
         if action=="clean":
             with db() as conn:
                 count=conn.execute("SELECT COUNT(*) c FROM jobs").fetchone()["c"]; conn.execute("DELETE FROM jobs")
@@ -672,10 +685,10 @@ async def handle_callback(cb:dict[str,Any]):
         else: await send_admin_panel(chat_id)
         return
     if not await is_joined(user_id):
-        await tg("answerCallbackQuery",{"callback_query_id":cb_id,"text":"اول عضو کانال شو.","show_alert":"true"})
+        await safe_answer_callback(cb_id,"اول عضو کانال شو.",True)
         if chat_id: await send_text(chat_id,"🔒 اول عضویتت رو تأیید کن.",join_keyboard())
         return
-    parts=data.split("|"); await tg("answerCallbackQuery",{"callback_query_id":cb_id,"text":"در حال آماده‌سازی…"})
+    parts=data.split("|"); await safe_answer_callback(cb_id,"در حال آماده‌سازی…")
     if not chat_id: return
     if parts[0]=="sp" and len(parts)==2:
         job=load_job(parts[1])
@@ -710,12 +723,12 @@ async def startup():
         except Exception: log.exception("Webhook setup failed")
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root(): return PlainTextResponse(f"{BRAND_NAME} V3 is running ✅")
 
 
 @app.get("/health")
-async def health(): return JSONResponse({"ok":True,"version":3,"platforms":["instagram","youtube","twitter","soundcloud","spotify"]})
+async def health(): return JSONResponse({"ok":True,"version":"3.1","platforms":["instagram","youtube","twitter","soundcloud","spotify"]})
 
 
 @app.post("/telegram/{secret}")
