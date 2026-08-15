@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import html
 import json
 import logging
@@ -29,6 +30,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me").strip()
 COOKIE_FILE = os.getenv("COOKIE_FILE", "").strip()
 YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
+YOUTUBE_COOKIES_B64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
 MAX_SEND_MB = int(os.getenv("MAX_SEND_MB", "49"))
 MAX_PLAYLIST_ITEMS = int(os.getenv("MAX_PLAYLIST_ITEMS", "10"))
 DB_PATH = os.getenv("DB_PATH", "/tmp/bluegate_downloader.db").strip()
@@ -40,6 +42,22 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 JOB_TTL_HOURS = int(os.getenv("JOB_TTL_HOURS", "12"))
 SPOTIFY_ENABLED = os.getenv("SPOTIFY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 SPOTIFY_BITRATE = os.getenv("SPOTIFY_BITRATE", "128k").strip()
+
+def prepare_runtime_cookies() -> None:
+    """Materialize base64-encoded Netscape cookies from Render secrets."""
+    global YOUTUBE_COOKIE_FILE
+    if YOUTUBE_COOKIES_B64:
+        target = Path("/tmp/youtube_cookies.txt")
+        try:
+            raw = base64.b64decode(YOUTUBE_COOKIES_B64, validate=True)
+            target.write_bytes(raw)
+            os.chmod(target, 0o600)
+            YOUTUBE_COOKIE_FILE = str(target)
+            log.info("YouTube cookie file loaded from YOUTUBE_COOKIES_B64")
+        except Exception as exc:
+            log.error("Could not decode YOUTUBE_COOKIES_B64: %s", exc)
+
+prepare_runtime_cookies()
 
 if not BOT_TOKEN:
     log.warning("BOT_TOKEN is not set")
@@ -487,11 +505,17 @@ def download_audio_sync(source_url: str, playlist_index: int, bitrate: str, outd
 def download_spotify_sync(source_url: str, outdir: Path) -> list[Path]:
     cmd=[sys.executable,"-m","spotdl","download",source_url,"--output",str(outdir/"{artist} - {title}.{output-ext}"),
          "--format","mp3","--bitrate",SPOTIFY_BITRATE]
+    cookie = YOUTUBE_COOKIE_FILE or COOKIE_FILE
+    if cookie and Path(cookie).exists():
+        cmd.extend(["--cookie-file", cookie])
     proc=subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
+    output = (proc.stdout or "").strip()
     if proc.returncode!=0:
-        raise RuntimeError("spotDL failed: "+proc.stdout[-600:])
+        raise RuntimeError("spotDL/YouTube failed:\n" + output[-1600:])
     files=sorted([p for p in outdir.rglob("*.mp3") if p.is_file()], key=lambda p:p.stat().st_mtime)
-    if not files: raise RuntimeError("spotDL فایل MP3 نساخت.")
+    if not files:
+        hint = output[-1600:] if output else "No output from spotDL."
+        raise RuntimeError("spotDL خروجی صوتی نساخت. علت احتمالی خطای YouTube/YouTube Music است:\n" + hint)
     return files[:MAX_PLAYLIST_ITEMS]
 
 
