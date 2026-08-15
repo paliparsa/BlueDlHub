@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: bluegate-multi-downloader-v4
+    name: bluegate-multi-downloader-v4-2
     runtime: docker
     plan: free
     healthCheckPath: /health
@@ -11,6 +11,10 @@ services:
         sync: false
       - key: WEBHOOK_SECRET
         generateValue: true
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: FASTSAVER_API_KEY
         sync: false
       - key: FASTSAVER_BASE_URL
@@ -25,8 +29,6 @@ services:
         value: "BlueGate Downloader"
       - key: SUPPORT_USERNAME
         value: "BlueGateSupport"
-      - key: ADMIN_IDS
-        sync: false
       - key: DB_PATH
         value: "/tmp/bluegate_downloader.db"
       - key: JOB_TTL_HOURS

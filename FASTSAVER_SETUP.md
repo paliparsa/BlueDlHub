@@ -1,19 +1,23 @@
-# FastSaver setup for BlueGate V4
+# FastSaver Setup — V4.2 API Pool
 
-1. Create/get a FastSaver API key from the FastSaver dashboard.
-2. Open Render -> your BlueGate service -> Environment.
-3. Add:
+V4.2 does not require a single `FASTSAVER_API_KEY` environment variable.
 
-   FASTSAVER_API_KEY=fs_sk_...
+Recommended flow:
+1. Configure `DATABASE_URL` (Neon) first.
+2. In Telegram, as an admin: `/admin` -> **FastSaver APIs** -> **Add API**.
+3. Send a FastSaver API key.
+4. The bot checks the free `/balance` endpoint and saves the key to the database.
+5. Repeat for as many keys as you want.
 
-4. Keep your existing BOT_TOKEN, WEBHOOK_URL and WEBHOOK_SECRET.
-5. `YOUTUBE_COOKIES_B64`, PO-token variables and bgutil are not required by V4 for YouTube/Spotify.
-6. Deploy the latest GitHub commit.
+Pool strategies:
+- Sequential: use priority order until a key is limited/exhausted.
+- Round Robin: distribute calls across keys.
+- Most Credits: prefer the key with the largest last-known balance.
 
-Expected /health response includes:
+Fallback states:
+- HTTP 429 -> temporary rate limit/cooldown, then next key
+- HTTP 401 -> invalid key, then next key
+- exhausted quota/credits -> exhausted, then next key
+- 5xx/network error -> temporary cooldown, then next key
 
-- version: 4.0
-- youtube_provider: FastSaverAPI
-- spotify_provider: FastSaverAPI
-
-Spotify V4.0 supports individual Spotify Track URLs. YouTube video/Shorts and audio are supported. YouTube playlists are not expanded by FastSaver in this V4 build.
+`FASTSAVER_API_KEY` in Render is supported only as a legacy bootstrap key and is automatically imported into the pool.

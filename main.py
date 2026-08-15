@@ -16,6 +16,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except Exception:
+    psycopg = None
+    dict_row = None
+
 import httpx
 import instaloader
 import yt_dlp
@@ -26,7 +33,7 @@ logging.basicConfig(level=logging.INFO)
 # Avoid httpx logging full Telegram Bot API URLs (which contain the bot token).
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-log = logging.getLogger("bluegate-downloader-v4.1")
+log = logging.getLogger("bluegate-downloader-v4.2")
 STARTED_AT = int(time.time())
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -38,6 +45,7 @@ YOUTUBE_COOKIES_B64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
 MAX_SEND_MB = int(os.getenv("MAX_SEND_MB", "49"))
 MAX_PLAYLIST_ITEMS = int(os.getenv("MAX_PLAYLIST_ITEMS", "10"))
 DB_PATH = os.getenv("DB_PATH", "/tmp/bluegate_downloader.db").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 BRAND_NAME = os.getenv("BRAND_NAME", "BlueGate Downloader").strip()
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "BlueGateSupport").strip().lstrip("@")
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "").strip()
@@ -74,7 +82,7 @@ if not BOT_TOKEN:
     log.warning("BOT_TOKEN is not set")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-app = FastAPI(title="BlueGate Multi Downloader V4.1 API Edition")
+app = FastAPI(title="BlueGate Multi Downloader V4.2 Hybrid Admin/API Pool")
 loader = instaloader.Instaloader(download_pictures=False, download_videos=False, save_metadata=False, quiet=True)
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
@@ -98,47 +106,148 @@ def now_ts() -> int:
     return int(time.time())
 
 
+class CompatRow(dict):
+    """Mapping row that also supports row[0] like sqlite3.Row."""
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+
+class CompatCursor:
+    def __init__(self, cursor, postgres: bool):
+        self.cursor = cursor
+        self.postgres = postgres
+    def _row(self, row):
+        if row is None or not self.postgres:
+            return row
+        return CompatRow(row)
+    def fetchone(self):
+        return self._row(self.cursor.fetchone())
+    def fetchall(self):
+        return [self._row(r) for r in self.cursor.fetchall()]
+
+
+class CompatConn:
+    def __init__(self, raw, postgres: bool):
+        self.raw = raw
+        self.postgres = postgres
+    def execute(self, sql: str, params=()):
+        if self.postgres:
+            sql = sql.replace("?", "%s")
+        return CompatCursor(self.raw.execute(sql, params), self.postgres)
+    def executescript(self, script: str):
+        # Our schema statements contain no semicolons inside strings/procedures.
+        for statement in script.split(";"):
+            statement = statement.strip()
+            if statement:
+                self.execute(statement)
+
+
 @contextmanager
 def db():
-    path = Path(DB_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
+    if DATABASE_URL:
+        if psycopg is None:
+            raise RuntimeError("DATABASE_URL تنظیم شده ولی psycopg نصب نیست.")
+        # Disable server-side prepared statements for PgBouncer/pooled Neon URLs.
+        raw = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=12, prepare_threshold=None)
+        conn = CompatConn(raw, True)
+    else:
+        path = Path(DB_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = sqlite3.connect(path)
+        raw.row_factory = sqlite3.Row
+        conn = CompatConn(raw, False)
     try:
         yield conn
-        conn.commit()
+        raw.commit()
+    except Exception:
+        raw.rollback()
+        raise
     finally:
-        conn.close()
+        raw.close()
+
+
+def db_backend() -> str:
+    return "Neon/PostgreSQL" if DATABASE_URL else "SQLite (ephemeral on Render)"
 
 
 def init_db():
     with db() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
-            joined_at INTEGER NOT NULL, last_seen INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS jobs (
-            job_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL,
-            source_url TEXT NOT NULL, result_json TEXT NOT NULL, created_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS downloads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, job_id TEXT,
-            media_type TEXT, quality TEXT, bytes INTEGER DEFAULT 0,
-            platform TEXT DEFAULT 'unknown', created_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS media_cache (
-            cache_key TEXT PRIMARY KEY, file_id TEXT NOT NULL, title TEXT, platform TEXT, updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS bans (user_id INTEGER PRIMARY KEY, reason TEXT, created_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS error_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, platform TEXT, error TEXT, created_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS admin_state (admin_id INTEGER PRIMARY KEY, action TEXT NOT NULL, payload TEXT, updated_at INTEGER NOT NULL);
-        """)
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(downloads)").fetchall()}
-        if "platform" not in cols:
-            conn.execute("ALTER TABLE downloads ADD COLUMN platform TEXT DEFAULT 'unknown'")
+        if DATABASE_URL:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT,
+                joined_at BIGINT NOT NULL, last_seen BIGINT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, chat_id BIGINT NOT NULL,
+                source_url TEXT NOT NULL, result_json TEXT NOT NULL, created_at BIGINT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS downloads (
+                id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, job_id TEXT,
+                media_type TEXT, quality TEXT, bytes BIGINT DEFAULT 0,
+                platform TEXT DEFAULT 'unknown', created_at BIGINT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS media_cache (
+                cache_key TEXT PRIMARY KEY, file_id TEXT NOT NULL, title TEXT, platform TEXT, updated_at BIGINT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS bans (user_id BIGINT PRIMARY KEY, reason TEXT, created_at BIGINT NOT NULL);
+            CREATE TABLE IF NOT EXISTS error_logs (id BIGSERIAL PRIMARY KEY, user_id BIGINT, platform TEXT, error TEXT, created_at BIGINT NOT NULL);
+            CREATE TABLE IF NOT EXISTS admin_state (admin_id BIGINT PRIMARY KEY, action TEXT NOT NULL, payload TEXT, updated_at BIGINT NOT NULL);
+            CREATE TABLE IF NOT EXISTS admin_modes (admin_id BIGINT PRIMARY KEY, mode TEXT NOT NULL, updated_at BIGINT NOT NULL);
+            CREATE TABLE IF NOT EXISTS fastsaver_keys (
+                key_id TEXT PRIMARY KEY, key_secret TEXT UNIQUE NOT NULL, label TEXT,
+                priority INTEGER NOT NULL DEFAULT 100, enabled INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'active', cooldown_until BIGINT NOT NULL DEFAULT 0,
+                last_error TEXT, last_used BIGINT NOT NULL DEFAULT 0, balance_json TEXT,
+                created_at BIGINT NOT NULL
+            );
+            """)
+            conn.execute("ALTER TABLE downloads ADD COLUMN IF NOT EXISTS platform TEXT DEFAULT 'unknown'")
+        else:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+                joined_at INTEGER NOT NULL, last_seen INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL,
+                source_url TEXT NOT NULL, result_json TEXT NOT NULL, created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS downloads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, job_id TEXT,
+                media_type TEXT, quality TEXT, bytes INTEGER DEFAULT 0,
+                platform TEXT DEFAULT 'unknown', created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS media_cache (
+                cache_key TEXT PRIMARY KEY, file_id TEXT NOT NULL, title TEXT, platform TEXT, updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS bans (user_id INTEGER PRIMARY KEY, reason TEXT, created_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS error_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, platform TEXT, error TEXT, created_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS admin_state (admin_id INTEGER PRIMARY KEY, action TEXT NOT NULL, payload TEXT, updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS admin_modes (admin_id INTEGER PRIMARY KEY, mode TEXT NOT NULL, updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS fastsaver_keys (
+                key_id TEXT PRIMARY KEY, key_secret TEXT UNIQUE NOT NULL, label TEXT,
+                priority INTEGER NOT NULL DEFAULT 100, enabled INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'active', cooldown_until INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT, last_used INTEGER NOT NULL DEFAULT 0, balance_json TEXT,
+                created_at INTEGER NOT NULL
+            );
+            """)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(downloads)").fetchall()}
+            if "platform" not in cols:
+                conn.execute("ALTER TABLE downloads ADD COLUMN platform TEXT DEFAULT 'unknown'")
         conn.execute("DELETE FROM jobs WHERE created_at < ?", (now_ts() - JOB_TTL_HOURS * 3600,))
+
+    # Backwards compatibility: the old single Render key becomes pool key #1 once.
+    if FASTSAVER_API_KEY:
+        try:
+            add_fastsaver_key(FASTSAVER_API_KEY, "Render ENV", validate=False)
+        except Exception as exc:
+            log.warning("Could not bootstrap FASTSAVER_API_KEY into pool: %s", exc)
 
 
 def upsert_user(user: dict[str, Any]):
@@ -217,7 +326,7 @@ def is_banned(user_id: int) -> bool:
 
 def set_ban(user_id: int, banned: bool, reason: str="Admin") -> None:
     with db() as conn:
-        if banned: conn.execute("INSERT OR REPLACE INTO bans(user_id,reason,created_at) VALUES(?,?,?)",(user_id,reason,now_ts()))
+        if banned: conn.execute("INSERT INTO bans(user_id,reason,created_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason, created_at=excluded.created_at",(user_id,reason,now_ts()))
         else: conn.execute("DELETE FROM bans WHERE user_id=?",(user_id,))
 
 
@@ -240,7 +349,7 @@ def user_downloads_today(user_id:int) -> int:
 
 
 def set_admin_state(admin_id:int, action:str, payload:str="") -> None:
-    with db() as conn: conn.execute("INSERT OR REPLACE INTO admin_state(admin_id,action,payload,updated_at) VALUES(?,?,?,?)",(admin_id,action,payload,now_ts()))
+    with db() as conn: conn.execute("INSERT INTO admin_state(admin_id,action,payload,updated_at) VALUES(?,?,?,?) ON CONFLICT(admin_id) DO UPDATE SET action=excluded.action,payload=excluded.payload,updated_at=excluded.updated_at",(admin_id,action,payload,now_ts()))
 
 
 def pop_admin_state(admin_id:int):
@@ -256,6 +365,165 @@ def force_join_channel() -> str:
 
 def force_join_url() -> str:
     return get_setting("force_join_url", FORCE_JOIN_URL)
+
+def get_admin_mode(admin_id: int) -> str:
+    if admin_id not in ADMIN_IDS:
+        return "user"
+    with db() as conn:
+        row = conn.execute("SELECT mode FROM admin_modes WHERE admin_id=?", (admin_id,)).fetchone()
+    return row["mode"] if row and row["mode"] in {"admin", "user"} else "admin"
+
+
+def set_admin_mode(admin_id: int, mode: str) -> None:
+    if admin_id not in ADMIN_IDS:
+        return
+    mode = "user" if mode == "user" else "admin"
+    with db() as conn:
+        conn.execute("INSERT INTO admin_modes(admin_id,mode,updated_at) VALUES(?,?,?) ON CONFLICT(admin_id) DO UPDATE SET mode=excluded.mode,updated_at=excluded.updated_at", (admin_id, mode, now_ts()))
+
+
+def mask_api_key(secret: str) -> str:
+    if len(secret) <= 12:
+        return secret[:3] + "••••"
+    return secret[:7] + "••••••" + secret[-4:]
+
+
+def add_fastsaver_key(secret: str, label: str = "", validate: bool = False) -> str:
+    secret = secret.strip()
+    if not secret:
+        raise ValueError("API key خالی است.")
+    key_id = secrets.token_hex(4)
+    with db() as conn:
+        existing = conn.execute("SELECT key_id FROM fastsaver_keys WHERE key_secret=?", (secret,)).fetchone()
+        if existing:
+            return existing["key_id"]
+        row = conn.execute("SELECT COALESCE(MAX(priority),0) p FROM fastsaver_keys").fetchone()
+        priority = int(row["p"] or 0) + 10
+        conn.execute("INSERT INTO fastsaver_keys(key_id,key_secret,label,priority,enabled,status,cooldown_until,last_error,last_used,balance_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                     (key_id, secret, label or f"API {priority//10}", priority, 1, "active", 0, "", 0, "", now_ts()))
+    return key_id
+
+
+def list_fastsaver_keys(include_disabled: bool = True):
+    with db() as conn:
+        sql = "SELECT * FROM fastsaver_keys"
+        if not include_disabled:
+            sql += " WHERE enabled=1 AND status NOT IN ('invalid','exhausted')"
+        sql += " ORDER BY priority ASC, created_at ASC"
+        return conn.execute(sql).fetchall()
+
+
+def get_fastsaver_key(key_id: str):
+    with db() as conn:
+        return conn.execute("SELECT * FROM fastsaver_keys WHERE key_id=?", (key_id,)).fetchone()
+
+
+def update_fastsaver_key(key_id: str, **fields) -> None:
+    allowed = {"label","priority","enabled","status","cooldown_until","last_error","last_used","balance_json"}
+    fields = {k:v for k,v in fields.items() if k in allowed}
+    if not fields:
+        return
+    sets = ",".join(f"{k}=?" for k in fields)
+    with db() as conn:
+        conn.execute(f"UPDATE fastsaver_keys SET {sets} WHERE key_id=?", tuple(fields.values()) + (key_id,))
+
+
+def delete_fastsaver_key(key_id: str) -> None:
+    with db() as conn:
+        conn.execute("DELETE FROM fastsaver_keys WHERE key_id=?", (key_id,))
+
+
+def toggle_fastsaver_key(key_id: str) -> None:
+    row = get_fastsaver_key(key_id)
+    if row:
+        update_fastsaver_key(key_id, enabled=0 if int(row["enabled"] or 0) else 1,
+                             status="active" if not int(row["enabled"] or 0) else row["status"])
+
+
+def move_fastsaver_key(key_id: str, direction: int) -> None:
+    rows = list_fastsaver_keys(True)
+    ids = [r["key_id"] for r in rows]
+    if key_id not in ids:
+        return
+    i = ids.index(key_id); j = i + direction
+    if j < 0 or j >= len(rows):
+        return
+    a,b=rows[i],rows[j]
+    update_fastsaver_key(a["key_id"], priority=int(b["priority"]))
+    update_fastsaver_key(b["key_id"], priority=int(a["priority"]))
+
+
+def _balance_number(data: Any) -> float | None:
+    if not isinstance(data, dict):
+        return None
+    preferred = ("credits_remaining","remaining_credits","remaining","credits","balance")
+    for k in preferred:
+        if k in data and isinstance(data[k], (int,float)):
+            return float(data[k])
+    for v in data.values():
+        if isinstance(v, dict):
+            x = _balance_number(v)
+            if x is not None: return x
+    return None
+
+
+def fastsaver_strategy() -> str:
+    v = get_setting("fastsaver_strategy", "sequential")
+    return v if v in {"sequential","round_robin","most_credits"} else "sequential"
+
+
+def fastsaver_candidates():
+    rows = list_fastsaver_keys(False)
+    now = now_ts()
+    # Expired cooldowns automatically become active again.
+    for r in rows:
+        if r["status"] == "rate_limited" and int(r["cooldown_until"] or 0) <= now:
+            update_fastsaver_key(r["key_id"], status="active", cooldown_until=0)
+    rows = [r for r in list_fastsaver_keys(False) if not (r["status"] == "rate_limited" and int(r["cooldown_until"] or 0) > now)]
+    strategy = fastsaver_strategy()
+    if strategy == "round_robin":
+        rows.sort(key=lambda r: (int(r["last_used"] or 0), int(r["priority"] or 0)))
+    elif strategy == "most_credits":
+        def credit(r):
+            try: data=json.loads(r["balance_json"] or "{}")
+            except Exception: data={}
+            x=_balance_number(data)
+            return -1 if x is None else x
+        rows.sort(key=lambda r: (-credit(r), int(r["priority"] or 0)))
+    return rows
+
+
+class FastSaverHTTPError(RuntimeError):
+    def __init__(self, status: int, detail: str, key_id: str = ""):
+        self.status=status; self.detail=detail; self.key_id=key_id
+        super().__init__(f"FastSaver HTTP {status}: {detail}")
+
+
+def _fastsaver_account_failure(status: int, detail: str) -> tuple[str | None, int]:
+    d=detail.lower()
+    if status == 401:
+        return "invalid", 0
+    if status == 429:
+        return "rate_limited", 90
+    if status in {402,403} and any(x in d for x in ("credit","quota","subscription","limit")):
+        return "exhausted", 0
+    if status == 400 and any(x in d for x in ("insufficient credit","not enough credit","credits exhausted","out of credit","quota exceeded")):
+        return "exhausted", 0
+    if status >= 500:
+        return "temporary", 30
+    return None, 0
+
+
+def fastsaver_pool_summary() -> dict[str,int]:
+    rows=list_fastsaver_keys(True); now=now_ts()
+    out={"total":len(rows),"active":0,"rate_limited":0,"exhausted":0,"invalid":0,"disabled":0}
+    for r in rows:
+        if not int(r["enabled"] or 0): out["disabled"]+=1
+        elif r["status"]=="rate_limited" and int(r["cooldown_until"] or 0)>now: out["rate_limited"]+=1
+        elif r["status"] in out: out[r["status"]]+=1
+        else: out["active"]+=1
+    return out
+
 
 def stats() -> dict[str, Any]:
     day = now_ts() - 86400
@@ -447,31 +715,63 @@ def analyze_generic_ydl(url: str, platform: str, kind: str | None = None) -> dic
             "media":media}
 
 
-def fastsaver_headers() -> dict[str, str]:
-    if not FASTSAVER_API_KEY:
-        raise RuntimeError("FASTSAVER_API_KEY روی Render تنظیم نشده.")
-    return {"X-Api-Key": FASTSAVER_API_KEY, "Accept": "application/json"}
+def fastsaver_headers(secret: str) -> dict[str, str]:
+    return {"X-Api-Key": secret, "Accept": "application/json"}
 
 
-def fastsaver_error(response: httpx.Response, data: Any = None) -> RuntimeError:
+def _extract_detail(response: httpx.Response, data: Any = None) -> str:
     detail = None
     if isinstance(data, dict):
         detail = data.get("detail") or data.get("error") or data.get("message")
-    if not detail:
-        detail = (response.text or f"HTTP {response.status_code}")[:500]
-    return RuntimeError(f"FastSaver HTTP {response.status_code}: {detail}")
+    return str(detail or (response.text or f"HTTP {response.status_code}"))[:500]
+
+
+def _handle_key_failure(row, status: int, detail: str, retry_after: int | None = None) -> bool:
+    state,cooldown=_fastsaver_account_failure(status,detail)
+    if not state:
+        return False
+    if state == "rate_limited":
+        cooldown=max(cooldown, retry_after or 0)
+        update_fastsaver_key(row["key_id"], status="rate_limited", cooldown_until=now_ts()+cooldown, last_error=detail)
+    elif state == "temporary":
+        update_fastsaver_key(row["key_id"], status="rate_limited", cooldown_until=now_ts()+cooldown, last_error=detail)
+    else:
+        update_fastsaver_key(row["key_id"], status=state, cooldown_until=0, last_error=detail)
+    return True
+
+
+def fastsaver_request_sync(method: str, path: str, *, params=None, payload=None, timeout: int = 60) -> dict[str,Any]:
+    candidates=fastsaver_candidates()
+    if not candidates:
+        raise RuntimeError("هیچ FastSaver API فعالی در Pool وجود ندارد. ادمین از پنل API اضافه کند.")
+    failures=[]
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        for row in candidates:
+            try:
+                update_fastsaver_key(row["key_id"], last_used=now_ts())
+                r=client.request(method,f"{FASTSAVER_BASE_URL}{path}",params=params,json=payload,headers=fastsaver_headers(row["key_secret"]))
+                try: data=r.json()
+                except Exception: data=None
+                detail=_extract_detail(r,data)
+                if r.status_code >= 400:
+                    retry=int(r.headers.get("Retry-After","0") or 0) if str(r.headers.get("Retry-After","0")).isdigit() else 0
+                    if _handle_key_failure(row,r.status_code,detail,retry):
+                        failures.append(f"{mask_api_key(row['key_secret'])}: {r.status_code} {detail}"); continue
+                    raise FastSaverHTTPError(r.status_code,detail,row["key_id"])
+                if not isinstance(data,dict) or ("ok" in data and not data.get("ok")):
+                    raise RuntimeError(detail)
+                update_fastsaver_key(row["key_id"], status="active", cooldown_until=0, last_error="")
+                return data
+            except FastSaverHTTPError:
+                raise
+            except (httpx.TransportError,httpx.TimeoutException) as exc:
+                update_fastsaver_key(row["key_id"],status="rate_limited",cooldown_until=now_ts()+30,last_error=str(exc)[:400])
+                failures.append(f"{mask_api_key(row['key_secret'])}: network {exc}")
+    raise RuntimeError("FastSaver همه APIها را امتحان کرد و هیچ‌کدام آماده نبودند. " + " | ".join(failures[-4:]))
 
 
 def fastsaver_youtube_info_sync(url: str) -> dict[str, Any]:
-    with httpx.Client(timeout=60, follow_redirects=True) as client:
-        r = client.get(f"{FASTSAVER_BASE_URL}/youtube/info", params={"url": url}, headers=fastsaver_headers())
-        try:
-            data = r.json()
-        except Exception:
-            data = None
-        if r.status_code >= 400 or not isinstance(data, dict) or not data.get("ok"):
-            raise fastsaver_error(r, data)
-        return data
+    return fastsaver_request_sync("GET","/youtube/info",params={"url":url},timeout=60)
 
 
 def analyze_youtube_fastsaver(url: str) -> dict[str, Any]:
@@ -480,70 +780,98 @@ def analyze_youtube_fastsaver(url: str) -> dict[str, Any]:
     qualities: list[int] = []
     size_map: dict[str, int] = {}
     for f in formats:
-        if f.get("type") != "video":
-            continue
+        if f.get("type") != "video": continue
         fmt = str(f.get("format") or "")
         m = re.fullmatch(r"(\d+)p", fmt)
-        if not m:
-            continue
-        q = int(m.group(1))
-        qualities.append(q)
-        try:
-            size_map[str(q)] = int(f.get("filesize") or 0)
-        except Exception:
-            pass
+        if not m: continue
+        q = int(m.group(1)); qualities.append(q)
+        try: size_map[str(q)] = int(f.get("filesize") or 0)
+        except Exception: pass
     qualities = sorted(set(qualities), reverse=True)
     safe_limit = MAX_SEND_MB * 1024 * 1024
     safe_qualities = [q for q in qualities if not size_map.get(str(q)) or size_map.get(str(q), 0) <= safe_limit]
-    if safe_qualities:
-        qualities = safe_qualities
-    return {
-        "platform":"youtube", "kind":"video", "url":url,
-        "title":str(info.get("title") or "YouTube video")[:180],
-        "owner":info.get("author") or "YouTube",
-        "thumbnail":info.get("thumbnail") or (info.get("thumbnails") or {}).get("max"),
-        "media":[{
-            "type":"video", "qualities":qualities[:8], "display_url":info.get("thumbnail"),
-            "playlist_index":1, "title":str(info.get("title") or "YouTube video")[:180],
-            "has_audio":True, "duration":info.get("duration"), "id":info.get("video_id"),
-            "filesizes":size_map,
-        }],
-        "provider":"fastsaver",
-    }
+    if safe_qualities: qualities = safe_qualities
+    return {"platform":"youtube","kind":"video","url":url,
+            "title":str(info.get("title") or "YouTube video")[:180],"owner":info.get("author") or "YouTube",
+            "thumbnail":info.get("thumbnail") or (info.get("thumbnails") or {}).get("max"),
+            "media":[{"type":"video","qualities":qualities[:8],"display_url":info.get("thumbnail"),"playlist_index":1,
+                      "title":str(info.get("title") or "YouTube video")[:180],"has_audio":True,"duration":info.get("duration"),
+                      "id":info.get("video_id"),"filesizes":size_map}],"provider":"fastsaver-pool"}
 
 
 async def fastsaver_json(method: str, path: str, *, params: dict[str, Any] | None = None, payload: dict[str, Any] | None = None, timeout: int | None = None) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=timeout or FASTSAVER_TIMEOUT, follow_redirects=True) as client:
-        r = await client.request(method, f"{FASTSAVER_BASE_URL}{path}", params=params, json=payload, headers=fastsaver_headers())
-        try:
-            data = r.json()
-        except Exception:
-            data = None
-        if r.status_code >= 400 or not isinstance(data, dict) or not data.get("ok"):
-            raise fastsaver_error(r, data)
+    candidates=fastsaver_candidates()
+    if not candidates:
+        raise RuntimeError("هیچ FastSaver API فعالی در Pool وجود ندارد. ادمین از پنل API اضافه کند.")
+    failures=[]
+    async with httpx.AsyncClient(timeout=timeout or FASTSAVER_TIMEOUT,follow_redirects=True) as client:
+        for row in candidates:
+            try:
+                update_fastsaver_key(row["key_id"],last_used=now_ts())
+                r=await client.request(method,f"{FASTSAVER_BASE_URL}{path}",params=params,json=payload,headers=fastsaver_headers(row["key_secret"]))
+                try: data=r.json()
+                except Exception: data=None
+                detail=_extract_detail(r,data)
+                if r.status_code >= 400:
+                    retry=int(r.headers.get("Retry-After","0") or 0) if str(r.headers.get("Retry-After","0")).isdigit() else 0
+                    if _handle_key_failure(row,r.status_code,detail,retry):
+                        failures.append(f"{mask_api_key(row['key_secret'])}: {r.status_code} {detail}"); continue
+                    raise FastSaverHTTPError(r.status_code,detail,row["key_id"])
+                if not isinstance(data,dict) or ("ok" in data and not data.get("ok")):
+                    raise RuntimeError(detail)
+                update_fastsaver_key(row["key_id"],status="active",cooldown_until=0,last_error="")
+                return data
+            except FastSaverHTTPError:
+                raise
+            except (httpx.TransportError,httpx.TimeoutException) as exc:
+                update_fastsaver_key(row["key_id"],status="rate_limited",cooldown_until=now_ts()+30,last_error=str(exc)[:400])
+                failures.append(f"{mask_api_key(row['key_secret'])}: network {exc}")
+    raise RuntimeError("FastSaver همه APIها را امتحان کرد و هیچ‌کدام آماده نبودند. " + " | ".join(failures[-4:]))
+
+
+async def fastsaver_probe_key(secret: str) -> dict[str,Any]:
+    async with httpx.AsyncClient(timeout=30,follow_redirects=True) as client:
+        r=await client.get(f"{FASTSAVER_BASE_URL}/balance",headers=fastsaver_headers(secret))
+        try: data=r.json()
+        except Exception: data=None
+        if r.status_code >= 400 or not isinstance(data,dict):
+            raise FastSaverHTTPError(r.status_code,_extract_detail(r,data))
         return data
+
+
+async def refresh_fastsaver_key(key_id: str) -> dict[str,Any]:
+    row=get_fastsaver_key(key_id)
+    if not row: raise RuntimeError("API پیدا نشد.")
+    data=await fastsaver_probe_key(row["key_secret"])
+    update_fastsaver_key(key_id,balance_json=json.dumps(data,ensure_ascii=False),status="active",cooldown_until=0,last_error="")
+    return data
+
+
+async def refresh_all_fastsaver_keys() -> tuple[int,int]:
+    ok=fail=0
+    for row in list_fastsaver_keys(True):
+        if not int(row["enabled"] or 0): continue
+        try: await refresh_fastsaver_key(row["key_id"]); ok+=1
+        except Exception as exc:
+            update_fastsaver_key(row["key_id"],last_error=str(exc)[:400]); fail+=1
+    return ok,fail
 
 
 async def fastsaver_youtube_download(url: str, quality: str, outdir: Path) -> Path:
     fmt = f"{quality}p" if quality.isdigit() else "720p"
     data = await fastsaver_json("POST", "/youtube/download", payload={"url":url, "format":fmt}, timeout=FASTSAVER_TIMEOUT)
     dl_url = data.get("download_url")
-    if not dl_url:
-        raise RuntimeError("FastSaver لینک دانلود برنگرداند.")
+    if not dl_url: raise RuntimeError("FastSaver لینک دانلود برنگرداند.")
     filename = str(data.get("filename") or f"youtube_{data.get('video_id','video')}_{fmt}.mp4")
     filename = re.sub(r"[^A-Za-z0-9._ -]+", "_", filename).strip(" .")[:180] or "youtube.mp4"
-    if not Path(filename).suffix:
-        filename += ".mp4"
-    dest = outdir / filename
-    await download_url(str(dl_url), dest)
-    return dest
+    if not Path(filename).suffix: filename += ".mp4"
+    dest = outdir / filename; await download_url(str(dl_url), dest); return dest
 
 
 async def fastsaver_search_music(query: str) -> dict[str, Any]:
     data = await fastsaver_json("GET", "/youtube/search", params={"query":query, "page":1}, timeout=90)
     results = [x for x in (data.get("results") or []) if isinstance(x, dict) and x.get("video_id")]
-    if not results:
-        raise RuntimeError("FastSaver/YouTube Music نتیجه‌ای برای این آهنگ پیدا نکرد.")
+    if not results: raise RuntimeError("FastSaver/YouTube Music نتیجه‌ای برای این آهنگ پیدا نکرد.")
     return results[0]
 
 
@@ -986,14 +1314,36 @@ async def send_all(job:dict[str,Any],user_id:int,chat_id:int):
     except Exception: pass
 
 
+def user_home_keyboard(user_id:int) -> dict:
+    rows=[
+        [{"text":"📥 دانلود از لینک","callback_data":"home|download"},{"text":"🎵 موزیک","callback_data":"home|music"}],
+        [{"text":"📊 حساب من","callback_data":"home|account"},{"text":"🟢 وضعیت سرویس‌ها","callback_data":"home|services"}],
+        [{"text":"❓ راهنما","callback_data":"home|help"}],
+    ]
+    if SUPPORT_USERNAME:
+        rows.append([{"text":"🆘 پشتیبانی","url":f"https://t.me/{SUPPORT_USERNAME}"}])
+    if user_id in ADMIN_IDS:
+        rows.append([{"text":"🛡 ورود به حالت ادمین","callback_data":"mode|admin"}])
+    return {"inline_keyboard":rows}
+
+
+async def send_user_home(chat_id:int,user_id:int,first_name:str=""):
+    used=user_downloads_today(user_id); lim=daily_limit(); remaining="نامحدود" if not lim else max(0,lim-used)
+    text=(f"👋 {html.escape(first_name) if first_name else ''}\n<b>{html.escape(BRAND_NAME)}</b>\n\n"
+          f"📥 دانلود امروز: <b>{used}</b>\n🎟 باقی‌مانده: <b>{remaining}</b>\n\n"
+          "لینک رو مستقیم بفرست یا از منوی پایین استفاده کن.")
+    await send_text(chat_id,text,user_home_keyboard(user_id))
+
+
 def admin_keyboard() -> dict:
     return {"inline_keyboard":[
-        [{"text":"📊 داشبورد","callback_data":"adm|stats"},{"text":"👥 کاربران","callback_data":"adm|users"}],
-        [{"text":"📢 Broadcast","callback_data":"adm|broadcast"},{"text":"🚫 Ban/Unban","callback_data":"adm|userfind"}],
-        [{"text":"🔌 سرویس‌ها","callback_data":"adm|services"},{"text":"🚦 محدودیت","callback_data":"adm|limit"}],
-        [{"text":"📢 Force Join","callback_data":"adm|forcejoin"},{"text":"🛠 Maintenance","callback_data":"adm|maintenance"}],
-        [{"text":"❌ خطاها","callback_data":"adm|errors"},{"text":"🩺 سیستم","callback_data":"adm|system"}],
-        [{"text":"🧹 پاکسازی Jobها","callback_data":"adm|clean"}]
+        [{"text":"📊 داشبورد","callback_data":"adm|stats"},{"text":"⚡ FastSaver APIs","callback_data":"adm|apis"}],
+        [{"text":"👥 کاربران","callback_data":"adm|users"},{"text":"🚫 Ban/Unban","callback_data":"adm|userfind"}],
+        [{"text":"📢 Broadcast","callback_data":"adm|broadcast"},{"text":"🔌 سرویس‌ها","callback_data":"adm|services"}],
+        [{"text":"🚦 محدودیت","callback_data":"adm|limit"},{"text":"📢 Force Join","callback_data":"adm|forcejoin"}],
+        [{"text":"🛠 Maintenance","callback_data":"adm|maintenance"},{"text":"❌ خطاها","callback_data":"adm|errors"}],
+        [{"text":"🩺 سیستم","callback_data":"adm|system"},{"text":"🧹 پاکسازی Jobها","callback_data":"adm|clean"}],
+        [{"text":"👤 سوییچ به حالت کاربر","callback_data":"mode|user"}]
     ]}
 
 
@@ -1001,16 +1351,69 @@ def services_keyboard() -> dict:
     rows=[]
     for p in ("instagram","youtube","twitter","soundcloud","spotify"):
         on=service_enabled(p); rows.append([{"text":f"{'✅' if on else '❌'} {PLATFORM_LABELS[p]}","callback_data":f"admtoggle|{p}"}])
-    rows.append([{"text":"⬅️ برگشت","callback_data":"adm|stats"}])
-    return {"inline_keyboard":rows}
+    rows.append([{"text":"⬅️ برگشت","callback_data":"adm|stats"}]); return {"inline_keyboard":rows}
+
+
+def api_status_icon(row) -> str:
+    if not int(row["enabled"] or 0): return "⏸"
+    return {"active":"🟢","rate_limited":"🟠","exhausted":"🔴","invalid":"⛔️"}.get(row["status"],"⚪️")
+
+
+def api_balance_label(row) -> str:
+    try: data=json.loads(row["balance_json"] or "{}")
+    except Exception: data={}
+    n=_balance_number(data)
+    return "?" if n is None else (str(int(n)) if float(n).is_integer() else f"{n:.1f}")
+
+
+async def send_api_manager(chat_id:int,page:int=0):
+    rows=list_fastsaver_keys(True); per=6; pages=max(1,(len(rows)+per-1)//per); page=max(0,min(page,pages-1))
+    pool=fastsaver_pool_summary(); strategy=fastsaver_strategy()
+    text=("⚡ <b>FastSaver API Pool</b>\n\n"
+          f"کل: <b>{pool['total']}</b> · 🟢 {pool['active']} · 🟠 {pool['rate_limited']} · 🔴 {pool['exhausted']} · ⛔️ {pool['invalid']} · ⏸ {pool['disabled']}\n"
+          f"🔀 Strategy: <b>{strategy}</b>\n\n"
+          "اگر یک Key به Rate Limit/اعتبار برسد، درخواست خودکار با Key بعدی ادامه پیدا می‌کند.")
+    kb=[]
+    for i,row in enumerate(rows[page*per:(page+1)*per],start=page*per+1):
+        kb.append([{"text":f"{api_status_icon(row)} #{i} {mask_api_key(row['key_secret'])} · 💳 {api_balance_label(row)}","callback_data":f"apiinfo|{row['key_id']}"}])
+    kb.append([{"text":"➕ Add API","callback_data":"apiadd"},{"text":"🔄 Refresh All","callback_data":"apirefresh"}])
+    kb.append([{"text":"🔀 تغییر Strategy","callback_data":"apistrategy"}])
+    nav=[]
+    if page>0: nav.append({"text":"⬅️","callback_data":f"apipage|{page-1}"})
+    nav.append({"text":f"{page+1}/{pages}","callback_data":"noop"})
+    if page<pages-1: nav.append({"text":"➡️","callback_data":f"apipage|{page+1}"})
+    kb.append(nav); kb.append([{"text":"⬅️ پنل ادمین","callback_data":"adm|stats"}])
+    await send_text(chat_id,text,{"inline_keyboard":kb})
+
+
+async def send_api_info(chat_id:int,key_id:str):
+    row=get_fastsaver_key(key_id)
+    if not row: return await send_text(chat_id,"❌ API پیدا نشد.")
+    cool=max(0,int(row["cooldown_until"] or 0)-now_ts())
+    text=(f"⚡ <b>{html.escape(row['label'] or 'FastSaver API')}</b>\n\n"
+          f"Key: <code>{html.escape(mask_api_key(row['key_secret']))}</code>\n"
+          f"Status: <b>{html.escape(row['status'])}</b> · Enabled: <b>{'YES' if int(row['enabled']) else 'NO'}</b>\n"
+          f"Priority: <b>{row['priority']}</b> · Credits: <b>{api_balance_label(row)}</b>\n"
+          f"Cooldown: <b>{cool}s</b>\n"
+          f"Last error: <code>{html.escape(row['last_error'] or '-')[:350]}</code>")
+    kb={"inline_keyboard":[
+        [{"text":"💳 Check Balance","callback_data":f"apicheck|{key_id}"},{"text":"⏯ Enable/Disable","callback_data":f"apitoggle|{key_id}"}],
+        [{"text":"⬆️ Priority","callback_data":f"apiup|{key_id}"},{"text":"⬇️ Priority","callback_data":f"apidown|{key_id}"}],
+        [{"text":"🗑 حذف API","callback_data":f"apidel|{key_id}"}],
+        [{"text":"⬅️ API Pool","callback_data":"adm|apis"}]
+    ]}
+    await send_text(chat_id,text,kb)
 
 
 async def send_admin_panel(chat_id:int):
-    s=stats(); gb=s["bytes"]/(1024**3)
+    s=stats(); gb=s["bytes"]/(1024**3); pool=fastsaver_pool_summary()
     with db() as conn:
         banned=conn.execute("SELECT COUNT(*) c FROM bans").fetchone()["c"]
         errors24=conn.execute("SELECT COUNT(*) c FROM error_logs WHERE created_at>=?",(now_ts()-86400,)).fetchone()["c"]
-    lines=["🛡 <b>BlueGate Admin · V4.1</b>","",f"👥 کاربران: <b>{s['users']}</b> · 🚫 بن: <b>{banned}</b>",f"🟢 فعال ۲۴h: <b>{s['active24']}</b>",f"📥 دانلود کل: <b>{s['downloads']}</b> · امروز: <b>{s['downloads24']}</b>",f"❌ خطای ۲۴h: <b>{errors24}</b>",f"💾 حجم: <b>{gb:.2f} GB</b>",f"🚦 سقف روزانه: <b>{daily_limit() or 'نامحدود'}</b>",f"🛠 Maintenance: <b>{'ON' if bool_setting('maintenance',False) else 'OFF'}</b>","","📊 <b>پلتفرم‌ها</b>"]
+    lines=["🛡 <b>BlueGate Admin · V4.2</b>","",f"👥 کاربران: <b>{s['users']}</b> · 🚫 بن: <b>{banned}</b>",f"🟢 فعال ۲۴h: <b>{s['active24']}</b>",
+           f"📥 دانلود کل: <b>{s['downloads']}</b> · امروز: <b>{s['downloads24']}</b>",f"❌ خطای ۲۴h: <b>{errors24}</b>",f"💾 حجم: <b>{gb:.2f} GB</b>",
+           f"🚦 سقف روزانه: <b>{daily_limit() or 'نامحدود'}</b>",f"🛠 Maintenance: <b>{'ON' if bool_setting('maintenance',False) else 'OFF'}</b>",
+           f"⚡ API Pool: <b>{pool['total']}</b> · Active <b>{pool['active']}</b> · Limited <b>{pool['rate_limited']}</b>",f"🗃 DB: <b>{db_backend()}</b>","","📊 <b>پلتفرم‌ها</b>"]
     for p,c in s["platforms"][:8]: lines.append(f"• {PLATFORM_LABELS.get(p,p)}: <b>{c}</b>")
     await send_text(chat_id,"\n".join(lines),admin_keyboard())
 
@@ -1018,8 +1421,7 @@ async def send_admin_panel(chat_id:int):
 async def admin_users(chat_id:int):
     with db() as conn: rows=conn.execute("SELECT user_id,username,first_name,last_seen FROM users ORDER BY last_seen DESC LIMIT 20").fetchall()
     lines=["👥 <b>۲۰ کاربر اخیر</b>",""]+[f"• @{html.escape(r['username']) if r['username'] else html.escape(r['first_name'] or '-') } · <code>{r['user_id']}</code>" for r in rows]
-    lines += ["","برای مدیریت یک نفر، دکمه Ban/Unban رو بزن و ID یا username رو بفرست."]
-    await send_text(chat_id,"\n".join(lines))
+    lines += ["","برای مدیریت یک نفر، Ban/Unban رو بزن و ID یا username رو بفرست."]; await send_text(chat_id,"\n".join(lines))
 
 
 async def admin_errors(chat_id:int):
@@ -1031,28 +1433,41 @@ async def admin_errors(chat_id:int):
 
 
 async def admin_system(chat_id:int):
-    du=shutil.disk_usage('/tmp'); up=now_ts()-STARTED_AT
+    du=shutil.disk_usage('/tmp'); up=now_ts()-STARTED_AT; pool=fastsaver_pool_summary()
     text=(f"🩺 <b>System Status</b>\n\n✅ Bot: Online\n⏱ Uptime: <b>{up//3600}h {(up%3600)//60}m</b>\n"
-          f"💽 /tmp free: <b>{du.free/(1024**3):.2f} GB</b>\n🗃 DB: <code>{html.escape(DB_PATH)}</code>\n"
-          f"⚡ FastSaver: <b>{'Configured' if FASTSAVER_API_KEY else 'Missing API key'}</b>\n📦 Version: <b>4.1</b>")
+          f"💽 /tmp free: <b>{du.free/(1024**3):.2f} GB</b>\n🗃 DB: <b>{db_backend()}</b>\n"
+          f"⚡ FastSaver Pool: <b>{pool['total']}</b> keys / <b>{pool['active']}</b> active\n📦 Version: <b>4.2</b>")
     await send_text(chat_id,text)
 
 
-async def handle_admin_input(user_id:int,chat_id:int,text:str,state:tuple[str,str]) -> bool:
+async def handle_admin_input(user_id:int,chat_id:int,text:str,state:tuple[str,str],message_id:int|None=None) -> bool:
     action,payload=state
+    if action=="apiadd":
+        secret=text.strip()
+        if message_id:
+            try: await tg("deleteMessage",{"chat_id":chat_id,"message_id":message_id})
+            except Exception: pass
+        status=await send_text(chat_id,"⚡ دارم API Key رو بررسی می‌کنم…")
+        try:
+            data=await fastsaver_probe_key(secret)
+            kid=add_fastsaver_key(secret,f"API {len(list_fastsaver_keys(True))+1}")
+            update_fastsaver_key(kid,balance_json=json.dumps(data,ensure_ascii=False),status="active",last_error="")
+            await edit_text(chat_id,status["message_id"],f"✅ API اضافه شد.\n<code>{html.escape(mask_api_key(secret))}</code>\n💳 Credits: <b>{_balance_number(data) if _balance_number(data) is not None else '?'}</b>")
+        except Exception as exc:
+            await edit_text(chat_id,status["message_id"],"❌ API Key تأیید نشد.\n<code>"+html.escape(str(exc))[:600]+"</code>")
+        return True
     if action=="broadcast":
-        with db() as conn: ids=[r[0] for r in conn.execute("SELECT user_id FROM users").fetchall()]
-        ok=fail=0; status=await send_text(chat_id,f"📢 ارسال برای {len(ids)} کاربر شروع شد…")
+        with db() as conn: ids=[r["user_id"] for r in conn.execute("SELECT user_id FROM users").fetchall()]
+        ok=fail=0; await send_text(chat_id,f"📢 ارسال برای {len(ids)} کاربر شروع شد…")
         for uid in ids:
             try: await send_text(uid,text); ok+=1
             except Exception: fail+=1
             await asyncio.sleep(.04)
-        await send_text(chat_id,f"✅ Broadcast تمام شد.\nموفق: <b>{ok}</b> · ناموفق: <b>{fail}</b>")
-        return True
+        await send_text(chat_id,f"✅ Broadcast تمام شد.\nموفق: <b>{ok}</b> · ناموفق: <b>{fail}</b>"); return True
     if action=="userfind":
         q=text.strip().lstrip('@')
         with db() as conn:
-            row=conn.execute("SELECT * FROM users WHERE user_id=?",(int(q) if q.lstrip('-').isdigit() else -999999,)).fetchone() if q.lstrip('-').isdigit() else conn.execute("SELECT * FROM users WHERE lower(username)=lower(?)",(q,)).fetchone()
+            row=conn.execute("SELECT * FROM users WHERE user_id=?",(int(q),)).fetchone() if q.lstrip('-').isdigit() else conn.execute("SELECT * FROM users WHERE lower(username)=lower(?)",(q,)).fetchone()
         if not row: await send_text(chat_id,"❌ کاربر پیدا نشد."); return True
         uid=row['user_id']; banned=is_banned(uid); cnt=user_downloads_today(uid)
         kb={"inline_keyboard":[[{"text":"✅ Unban" if banned else "🚫 Ban","callback_data":f"adminban|{uid}|{0 if banned else 1}"}]]}
@@ -1062,13 +1477,11 @@ async def handle_admin_input(user_id:int,chat_id:int,text:str,state:tuple[str,st
         except: await send_text(chat_id,"❌ فقط عدد بفرست؛ 0 یعنی نامحدود.")
         return True
     if action=="forcejoin":
-        parts=[x.strip() for x in text.split('|',1)]; channel=parts[0]
-        url=parts[1] if len(parts)>1 else ''
+        parts=[x.strip() for x in text.split('|',1)]; channel=parts[0]; url=parts[1] if len(parts)>1 else ''
         if channel.lower() in {'off','0','خاموش'}: channel=''; url=''
         set_setting('force_join_channel',channel); set_setting('force_join_url',url)
         await send_text(chat_id,f"✅ Force Join {'خاموش شد' if not channel else 'تنظیم شد: <code>'+html.escape(channel)+'</code>'}"); return True
     return False
-
 
 HELP_TEXT=(
     "لینک یکی از این سرویس‌ها رو بفرست 👇\n\n"
@@ -1076,7 +1489,7 @@ HELP_TEXT=(
     "▶️ <b>YouTube</b> — Video / Shorts + Audio (FastSaver API)\n"
     "𝕏 <b>X / Twitter</b> — Video / GIF / media\n"
     "☁️ <b>SoundCloud</b> — Track / set + MP3\n"
-    "🟢 <b>Spotify</b> — Track → YouTube Music match + Telegram audio\n\n"
+    "🟢 <b>Spotify</b> — Track → YouTube Music match via FastSaver API Pool\n\n"
     f"📦 حداکثر آیتم Playlist در هر درخواست: <b>{MAX_PLAYLIST_ITEMS}</b>\n"
     "فقط محتوایی رو دانلود کن که اجازه ذخیره/استفاده ازش رو داری."
 )
@@ -1084,27 +1497,36 @@ HELP_TEXT=(
 
 async def handle_message(message:dict[str,Any]):
     chat_id=message["chat"]["id"]; user=message.get("from",{}); user_id=user.get("id",chat_id); upsert_user(user)
-    text=message.get("text") or message.get("caption") or ""
+    text=message.get("text") or message.get("caption") or ""; msg_id=message.get("message_id")
     if user_id in ADMIN_IDS:
         state=pop_admin_state(user_id)
         if state and not text.startswith("/"):
-            if await handle_admin_input(user_id,chat_id,text,state): return
+            if await handle_admin_input(user_id,chat_id,text,state,msg_id): return
     if user_id not in ADMIN_IDS and is_banned(user_id):
         await send_text(chat_id,"⛔️ دسترسی شما به بات مسدود شده."); return
     if user_id not in ADMIN_IDS and bool_setting("maintenance",False):
         await send_text(chat_id,"🛠 بات موقتاً در حال بروزرسانیه. کمی بعد دوباره امتحان کن."); return
-    if text.startswith("/start") or text.startswith("/help"):
-        if not await ensure_joined(user_id,chat_id): return
-        await send_text(chat_id,f"سلام 👋\nبه <b>{html.escape(BRAND_NAME)} V4</b> خوش اومدی.\n\n{HELP_TEXT}"+(f"\n\n🆘 @{html.escape(SUPPORT_USERNAME)}" if SUPPORT_USERNAME else ""))
-        return
-    if text.startswith("/admin") or text.startswith("/stats"):
-        if user_id in ADMIN_IDS: await send_admin_panel(chat_id)
+    if text.startswith("/admin"):
+        if user_id in ADMIN_IDS:
+            set_admin_mode(user_id,"admin"); await send_admin_panel(chat_id)
         else: await send_text(chat_id,"⛔️ دسترسی ادمین نداری.")
         return
+    if text.startswith("/user"):
+        if user_id in ADMIN_IDS: set_admin_mode(user_id,"user")
+        if not await ensure_joined(user_id,chat_id): return
+        await send_user_home(chat_id,user_id,user.get("first_name","")); return
+    if text.startswith("/start"):
+        if user_id in ADMIN_IDS and get_admin_mode(user_id)=="admin":
+            await send_admin_panel(chat_id); return
+        if not await ensure_joined(user_id,chat_id): return
+        await send_user_home(chat_id,user_id,user.get("first_name","")); return
+    if text.startswith("/help"):
+        if not await ensure_joined(user_id,chat_id): return
+        await send_text(chat_id,HELP_TEXT,user_home_keyboard(user_id)); return
     if not await ensure_joined(user_id,chat_id): return
     url=clean_url(text)
     if not url:
-        await send_text(chat_id,HELP_TEXT); return
+        await send_user_home(chat_id,user_id,user.get("first_name","")); return
     platform=detect_platform(url)
     if not service_enabled(platform):
         await send_text(chat_id,f"⛔️ سرویس {PLATFORM_LABELS.get(platform,platform)} فعلاً توسط ادمین غیرفعاله."); return
@@ -1112,36 +1534,55 @@ async def handle_message(message:dict[str,Any]):
     if user_id not in ADMIN_IDS and lim and user_downloads_today(user_id)>=lim:
         await send_text(chat_id,f"🚦 سقف دانلود روزانه‌ات ({lim}) پر شده. فردا دوباره امتحان کن."); return
     if platform=="generic":
-        await send_text(chat_id,"❌ این دامنه فعلاً در V4 فعال نیست. Instagram / YouTube / X / SoundCloud / Spotify رو بفرست."); return
+        await send_text(chat_id,"❌ این دامنه فعلاً فعال نیست. Instagram / YouTube / X / SoundCloud / Spotify رو بفرست."); return
     status=await send_text(chat_id,f"{PLATFORM_ICONS.get(platform,'🌐')} دارم لینک {PLATFORM_LABELS.get(platform,platform)} رو آنالیز می‌کنم…")
     try:
         result=await analyze(url); job_id=save_job(user_id,chat_id,url,result)
         await edit_text(chat_id,status["message_id"],result_text(result),build_keyboard(result,job_id))
     except Exception as exc:
-        log_error(user_id,platform,exc)
-        log.exception("analyze failed")
-        hints={"instagram":"اگر محتوا Private/Story باشه ممکنه Cookie لازم باشه.","youtube":"YouTube در V4 از FastSaver API استفاده می‌کند؛ API key و اعتبار حساب را بررسی کن.",
-               "soundcloud":"SoundCloud گاهی extractor را موقتاً محدود می‌کند.","spotify":"Spotify در V4 از FastSaver + YouTube Music استفاده می‌کند؛ فعلاً Track تکی پشتیبانی می‌شود."}
+        log_error(user_id,platform,exc); log.exception("analyze failed")
+        hints={"instagram":"اگر محتوا Private/Story باشه ممکنه Cookie لازم باشه.","youtube":"YouTube از FastSaver API Pool استفاده می‌کند؛ وضعیت APIها را در پنل ادمین ببین.",
+               "soundcloud":"SoundCloud گاهی extractor را موقتاً محدود می‌کند.","spotify":"Spotify از FastSaver API Pool + YouTube Music استفاده می‌کند؛ فعلاً Track تکی پشتیبانی می‌شود."}
         await edit_text(chat_id,status["message_id"],f"❌ نتونستم لینک رو بخونم.\n\n💡 {hints.get(platform,'')}\n\n<code>{html.escape(str(exc))[:500]}</code>")
 
 
 async def handle_callback(cb:dict[str,Any]):
     cb_id=cb["id"]; message=cb.get("message") or {}; chat_id=message.get("chat",{}).get("id")
     user=cb.get("from",{}); user_id=user.get("id"); data=cb.get("data",""); upsert_user(user)
+    if data=="noop": await safe_answer_callback(cb_id); return
     if data=="joincheck":
         if await is_joined(user_id):
             await safe_answer_callback(cb_id,"عضویت تأیید شد ✅")
-            if chat_id: await send_text(chat_id,"✅ عضویت تأیید شد. حالا لینک رو بفرست.")
+            if chat_id: await send_user_home(chat_id,user_id,user.get("first_name",""))
         else: await safe_answer_callback(cb_id,"هنوز عضویت تأیید نشده.",True)
         return
+    if data.startswith("mode|"):
+        if user_id not in ADMIN_IDS: await safe_answer_callback(cb_id,"Access denied",True); return
+        mode=data.split("|",1)[1]; set_admin_mode(user_id,mode); await safe_answer_callback(cb_id,"حالت تغییر کرد ✅")
+        if mode=="admin": await send_admin_panel(chat_id)
+        else: await send_user_home(chat_id,user_id,user.get("first_name",""))
+        return
+    if data.startswith("home|"):
+        action=data.split("|",1)[1]; await safe_answer_callback(cb_id)
+        if action=="download": await send_text(chat_id,"📥 لینک Instagram / YouTube / X / SoundCloud رو همینجا بفرست. بات خودش نوع لینک رو تشخیص می‌ده.")
+        elif action=="music": await send_text(chat_id,"🎵 لینک Spotify Track، SoundCloud یا YouTube رو بفرست. برای YouTube می‌تونی Audio/Video انتخاب کنی.")
+        elif action=="account":
+            used=user_downloads_today(user_id); lim=daily_limit(); rem="نامحدود" if not lim else max(0,lim-used)
+            await send_text(chat_id,f"📊 <b>حساب من</b>\n\n📥 دانلود امروز: <b>{used}</b>\n🎟 باقی‌مانده: <b>{rem}</b>\n🚦 سقف روزانه: <b>{lim or 'نامحدود'}</b>")
+        elif action=="services":
+            lines=["🟢 <b>وضعیت سرویس‌ها</b>",""]
+            for p in ("instagram","youtube","twitter","soundcloud","spotify"): lines.append(f"{'✅' if service_enabled(p) else '❌'} {PLATFORM_LABELS[p]}")
+            await send_text(chat_id,"\n".join(lines))
+        else: await send_text(chat_id,HELP_TEXT,user_home_keyboard(user_id))
+        return
     if data.startswith("adm|"):
-        if user_id not in ADMIN_IDS:
-            await safe_answer_callback(cb_id,"Access denied",True); return
+        if user_id not in ADMIN_IDS: await safe_answer_callback(cb_id,"Access denied",True); return
         action=data.split("|",1)[1]; await safe_answer_callback(cb_id)
         if action=="clean":
             with db() as conn: count=conn.execute("SELECT COUNT(*) c FROM jobs").fetchone()["c"]; conn.execute("DELETE FROM jobs")
             await send_text(chat_id,f"🧹 <b>{count}</b> Job پاک شد.")
         elif action=="users": await admin_users(chat_id)
+        elif action=="apis": await send_api_manager(chat_id)
         elif action=="services": await send_text(chat_id,"🔌 <b>سرویس‌ها</b>\nروی هر سرویس بزن تا روشن/خاموش بشه.",services_keyboard())
         elif action=="broadcast": set_admin_state(user_id,"broadcast"); await send_text(chat_id,"📢 پیام Broadcast رو همین الان بفرست. HTML تلگرام هم قابل استفاده‌ست.")
         elif action=="userfind": set_admin_state(user_id,"userfind"); await send_text(chat_id,"👤 Telegram ID یا username کاربر رو بفرست.")
@@ -1153,6 +1594,34 @@ async def handle_callback(cb:dict[str,Any]):
         elif action=="system": await admin_system(chat_id)
         else: await send_admin_panel(chat_id)
         return
+    if data=="apiadd":
+        if user_id not in ADMIN_IDS: await safe_answer_callback(cb_id,"Access denied",True); return
+        await safe_answer_callback(cb_id); set_admin_state(user_id,"apiadd")
+        await send_text(chat_id,"➕ FastSaver API Key رو بفرست.\nپیام حاوی Key بعد از دریافت تا حد ممکن از چت پاک می‌شه و Key کامل در پنل نمایش داده نمی‌شه."); return
+    if data=="apirefresh":
+        if user_id not in ADMIN_IDS: return
+        await safe_answer_callback(cb_id,"در حال بررسی…"); ok,fail=await refresh_all_fastsaver_keys(); await send_text(chat_id,f"🔄 Refresh تمام شد · ✅ {ok} · ❌ {fail}"); return
+    if data=="apistrategy":
+        if user_id not in ADMIN_IDS: return
+        order=["sequential","round_robin","most_credits"]; cur=fastsaver_strategy(); new=order[(order.index(cur)+1)%len(order)]; set_setting("fastsaver_strategy",new)
+        await safe_answer_callback(cb_id,f"Strategy: {new}"); await send_api_manager(chat_id); return
+    if data.startswith("apipage|"):
+        if user_id not in ADMIN_IDS: return
+        await safe_answer_callback(cb_id); await send_api_manager(chat_id,int(data.split('|')[1])); return
+    for prefix in ("apiinfo","apicheck","apitoggle","apidel","apiup","apidown"):
+        if data.startswith(prefix+"|"):
+            if user_id not in ADMIN_IDS: await safe_answer_callback(cb_id,"Access denied",True); return
+            kid=data.split("|",1)[1]; await safe_answer_callback(cb_id)
+            if prefix=="apiinfo": await send_api_info(chat_id,kid)
+            elif prefix=="apicheck":
+                try:
+                    d=await refresh_fastsaver_key(kid); await send_text(chat_id,f"✅ Balance refresh شد.\n💳 Credits: <b>{_balance_number(d) if _balance_number(d) is not None else '?'}</b>")
+                except Exception as exc: await send_text(chat_id,"❌ Balance check: <code>"+html.escape(str(exc))[:500]+"</code>")
+            elif prefix=="apitoggle": toggle_fastsaver_key(kid); await send_api_info(chat_id,kid)
+            elif prefix=="apidel": delete_fastsaver_key(kid); await send_text(chat_id,"🗑 API حذف شد."); await send_api_manager(chat_id)
+            elif prefix=="apiup": move_fastsaver_key(kid,-1); await send_api_info(chat_id,kid)
+            elif prefix=="apidown": move_fastsaver_key(kid,1); await send_api_info(chat_id,kid)
+            return
     if data.startswith("admtoggle|"):
         if user_id not in ADMIN_IDS: await safe_answer_callback(cb_id,"Access denied",True); return
         p=data.split("|",1)[1]; set_setting(f"service_{p}",'0' if service_enabled(p) else '1'); await safe_answer_callback(cb_id,"تغییر کرد ✅")
@@ -1160,10 +1629,8 @@ async def handle_callback(cb:dict[str,Any]):
     if data.startswith("adminban|"):
         if user_id not in ADMIN_IDS: await safe_answer_callback(cb_id,"Access denied",True); return
         _,uid,b=data.split('|'); set_ban(int(uid),b=='1'); await safe_answer_callback(cb_id,"انجام شد ✅"); await send_text(chat_id,f"{'🚫 Ban' if b=='1' else '✅ Unban'}: <code>{uid}</code>"); return
-    if user_id not in ADMIN_IDS and is_banned(user_id):
-        await safe_answer_callback(cb_id,"دسترسی مسدود است.",True); return
-    if user_id not in ADMIN_IDS and bool_setting("maintenance",False):
-        await safe_answer_callback(cb_id,"بات در حال بروزرسانی است.",True); return
+    if user_id not in ADMIN_IDS and is_banned(user_id): await safe_answer_callback(cb_id,"دسترسی مسدود است.",True); return
+    if user_id not in ADMIN_IDS and bool_setting("maintenance",False): await safe_answer_callback(cb_id,"بات در حال بروزرسانی است.",True); return
     if not await is_joined(user_id):
         await safe_answer_callback(cb_id,"اول عضو کانال شو.",True)
         if chat_id: await send_text(chat_id,"🔒 اول عضویتت رو تأیید کن.",join_keyboard())
@@ -1171,11 +1638,11 @@ async def handle_callback(cb:dict[str,Any]):
     parts=data.split("|"); await safe_answer_callback(cb_id,"در حال آماده‌سازی…")
     if not chat_id: return
     if parts[0]=="sp" and len(parts)==2:
-        job=load_job(parts[1])
+        job=load_job(parts[1]);
         if not job or job["user_id"]!=user_id: await send_text(chat_id,"⌛️ درخواست منقضی شده؛ لینک رو دوباره بفرست."); return
         await send_spotify(job,user_id,chat_id); return
     if parts[0]=="all" and len(parts)==2:
-        job=load_job(parts[1])
+        job=load_job(parts[1]);
         if not job or job["user_id"]!=user_id: await send_text(chat_id,"⌛️ درخواست منقضی شده؛ لینک رو دوباره بفرست."); return
         await send_all(job,user_id,chat_id); return
     if parts[0]=="a" and len(parts)==4:
@@ -1209,11 +1676,11 @@ async def startup():
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
-async def root(): return PlainTextResponse(f"{BRAND_NAME} V4 is running ✅")
+async def root(): return PlainTextResponse(f"{BRAND_NAME} V4.2 is running ✅")
 
 
 @app.get("/health")
-async def health(): return JSONResponse({"ok":True,"version":"4.1","platforms":["instagram","youtube","twitter","soundcloud","spotify"],"youtube_provider":"FastSaverAPI","spotify_provider":"FastSaverAPI"})
+async def health(): return JSONResponse({"ok":True,"version":"4.2","platforms":["instagram","youtube","twitter","soundcloud","spotify"],"youtube_provider":"FastSaverAPI","spotify_provider":"FastSaverAPI"})
 
 
 @app.post("/telegram/{secret}")

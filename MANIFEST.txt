@@ -1,17 +1,18 @@
-BlueGate Downloader V4.0 FULL ROOT
+BlueGate Downloader V4.2 FULL ROOT
 
-Required files in repository root:
-.env.example
-.gitignore
-Dockerfile
-MANIFEST.txt
-README.md
-VERSION
-main.py
-render.yaml
-requirements.txt
-start.sh
+Required runtime files:
+- main.py
+- requirements.txt
+- Dockerfile
+- start.sh
+- render.yaml
 
-V4 provider split:
-Instagram/X/SoundCloud = direct
-YouTube/Spotify = FastSaverAPI
+Configuration/docs:
+- .env.example
+- .gitignore
+- README.md
+- NEON_SETUP.md
+- ADMIN_V4_2.md
+- FASTSAVER_SETUP.md
+- VERSION
+- MANIFEST.txt
