@@ -1,48 +1,56 @@
-# BlueGate Downloader V4 — Hybrid API Edition
+# BlueGate Downloader V4.1
 
-V4 keeps the working direct extractors for Instagram, X/Twitter and SoundCloud, and moves only YouTube + Spotify to FastSaverAPI.
+Hybrid Telegram downloader.
 
-## Routing
+## Providers
+- Instagram: direct extractor
+- X/Twitter: direct extractor
+- SoundCloud: direct extractor
+- YouTube: FastSaverAPI
+- Spotify Track: Spotify metadata -> FastSaver YouTube search -> `/youtube/download` MP3
 
-- Instagram -> Instaloader / yt-dlp (direct)
-- X / Twitter -> yt-dlp (direct)
-- SoundCloud -> yt-dlp (direct)
-- YouTube -> FastSaverAPI (`/youtube/info`, `/youtube/download`, `/youtube/audio/tg-bot`)
-- Spotify Track -> Spotify oEmbed metadata -> FastSaver YouTube Music search -> FastSaver Telegram `file_id`
+## V4.1 Admin Panel
+Use `/admin` as an ID listed in `ADMIN_IDS`.
 
-Spotify Album/Playlist are intentionally not enabled in V4.0; only individual Track links are supported.
+Features:
+- Dashboard and per-platform stats
+- Recent users
+- Search user by Telegram ID / username
+- Ban / Unban
+- Broadcast
+- Enable / disable each platform
+- Daily per-user download limit (`0` = unlimited)
+- Force Join channel and URL from Telegram
+- Maintenance mode
+- Recent error center
+- System status
+- Job cleanup
 
-## Render setup
+Persistent admin settings live in SQLite (`DB_PATH`). On Render free instances `/tmp` may not be persistent across service replacement/restart, so use a persistent disk/database if you need settings and stats to survive redeploys.
 
-Required Environment variables:
-
-```text
-BOT_TOKEN=...
+## Required environment
+```env
+BOT_TOKEN=
 WEBHOOK_URL=https://YOUR-SERVICE.onrender.com
-WEBHOOK_SECRET=some-long-random-value
+WEBHOOK_SECRET=change-this
+ADMIN_IDS=123456789
 FASTSAVER_API_KEY=fs_sk_...
 ```
 
 Optional:
-
-```text
-ADMIN_IDS=123456789
+```env
+DB_PATH=/tmp/bluegate_downloader.db
 BRAND_NAME=BlueGate Downloader
 SUPPORT_USERNAME=BlueGateSupport
-FASTSAVER_BOT_USERNAME=@YourBotUsername
 MAX_SEND_MB=49
+MAX_PLAYLIST_ITEMS=10
+FASTSAVER_BASE_URL=https://api.fastsaver.io/v1
+FASTSAVER_TIMEOUT=300
+FORCE_JOIN_CHANNEL=
+FORCE_JOIN_URL=
 ```
 
-`FASTSAVER_BOT_USERNAME` is optional. If omitted, the bot calls Telegram `getMe` on startup and resolves it automatically.
+## Spotify V4.1 change
+V4 used `/youtube/audio/tg-bot` for Spotify. V4.1 deliberately does not use that path for Spotify. It searches for a matching YouTube track and then requests MP3 through the same FastSaver `/youtube/download` engine used by YouTube.
 
-## Important V4 behavior
-
-YouTube metadata/quality selection no longer uses yt-dlp, cookies or PO tokens. The bot asks FastSaver `/youtube/info` for the actual formats and then `/youtube/download` for the selected resolution.
-
-YouTube audio and Spotify Track delivery use FastSaver `/youtube/audio/tg-bot`, which returns a Telegram `file_id` scoped to your bot. V4 caches that file_id in SQLite, so repeated sends of the same resolved track do not consume another FastSaver call while the Render database survives.
-
-On Render Free, `/tmp` is ephemeral; cache and statistics reset when the instance is recreated/redeployed.
-
-## Deploy
-
-Put these files directly in the GitHub repository root, commit, and let Render redeploy the Docker service.
+Only Spotify Track URLs are enabled for now.

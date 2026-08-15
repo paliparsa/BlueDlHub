@@ -26,7 +26,8 @@ logging.basicConfig(level=logging.INFO)
 # Avoid httpx logging full Telegram Bot API URLs (which contain the bot token).
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-log = logging.getLogger("bluegate-downloader-v4")
+log = logging.getLogger("bluegate-downloader-v4.1")
+STARTED_AT = int(time.time())
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
@@ -73,7 +74,7 @@ if not BOT_TOKEN:
     log.warning("BOT_TOKEN is not set")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-app = FastAPI(title="BlueGate Multi Downloader V4 API Edition")
+app = FastAPI(title="BlueGate Multi Downloader V4.1 API Edition")
 loader = instaloader.Instaloader(download_pictures=False, download_videos=False, save_metadata=False, quiet=True)
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
@@ -129,6 +130,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS media_cache (
             cache_key TEXT PRIMARY KEY, file_id TEXT NOT NULL, title TEXT, platform TEXT, updated_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS bans (user_id INTEGER PRIMARY KEY, reason TEXT, created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS error_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, platform TEXT, error TEXT, created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS admin_state (admin_id INTEGER PRIMARY KEY, action TEXT NOT NULL, payload TEXT, updated_at INTEGER NOT NULL);
         """)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(downloads)").fetchall()}
         if "platform" not in cols:
@@ -183,6 +188,74 @@ def set_cached_file_id(cache_key: str, file_id: str, title: str = "", platform: 
             ON CONFLICT(cache_key) DO UPDATE SET file_id=excluded.file_id,title=excluded.title,platform=excluded.platform,updated_at=excluded.updated_at
         """, (cache_key, file_id, title, platform, now_ts()))
 
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with db() as conn:
+        row=conn.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with db() as conn:
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,str(value)))
+
+
+def bool_setting(key: str, default: bool=True) -> bool:
+    v=get_setting(key, "1" if default else "0").lower()
+    return v in {"1","true","yes","on"}
+
+
+def service_enabled(platform: str) -> bool:
+    return bool_setting(f"service_{platform}", True)
+
+
+def is_banned(user_id: int) -> bool:
+    with db() as conn:
+        return conn.execute("SELECT 1 FROM bans WHERE user_id=?",(user_id,)).fetchone() is not None
+
+
+def set_ban(user_id: int, banned: bool, reason: str="Admin") -> None:
+    with db() as conn:
+        if banned: conn.execute("INSERT OR REPLACE INTO bans(user_id,reason,created_at) VALUES(?,?,?)",(user_id,reason,now_ts()))
+        else: conn.execute("DELETE FROM bans WHERE user_id=?",(user_id,))
+
+
+def log_error(user_id: int|None, platform: str, exc: Exception|str) -> None:
+    try:
+        text=str(exc)[:1800]
+        with db() as conn: conn.execute("INSERT INTO error_logs(user_id,platform,error,created_at) VALUES(?,?,?,?)",(user_id,platform,text,now_ts()))
+    except Exception: pass
+
+
+def daily_limit() -> int:
+    try: return max(0,int(get_setting("daily_limit","20")))
+    except Exception: return 20
+
+
+def user_downloads_today(user_id:int) -> int:
+    start=now_ts()-86400
+    with db() as conn:
+        return conn.execute("SELECT COUNT(*) c FROM downloads WHERE user_id=? AND created_at>=?",(user_id,start)).fetchone()["c"]
+
+
+def set_admin_state(admin_id:int, action:str, payload:str="") -> None:
+    with db() as conn: conn.execute("INSERT OR REPLACE INTO admin_state(admin_id,action,payload,updated_at) VALUES(?,?,?,?)",(admin_id,action,payload,now_ts()))
+
+
+def pop_admin_state(admin_id:int):
+    with db() as conn:
+        row=conn.execute("SELECT action,payload FROM admin_state WHERE admin_id=?",(admin_id,)).fetchone()
+        if row: conn.execute("DELETE FROM admin_state WHERE admin_id=?",(admin_id,))
+    return (row["action"],row["payload"]) if row else None
+
+
+def force_join_channel() -> str:
+    return get_setting("force_join_channel", FORCE_JOIN_CHANNEL)
+
+
+def force_join_url() -> str:
+    return get_setting("force_join_url", FORCE_JOIN_URL)
 
 def stats() -> dict[str, Any]:
     day = now_ts() - 86400
@@ -588,9 +661,10 @@ async def edit_text(chat_id: int, message_id: int, text: str, reply_markup: dict
 
 
 async def is_joined(user_id: int) -> bool:
-    if not FORCE_JOIN_CHANNEL: return True
+    channel=force_join_channel()
+    if not channel: return True
     try:
-        member = await tg("getChatMember", {"chat_id":FORCE_JOIN_CHANNEL,"user_id":str(user_id)})
+        member = await tg("getChatMember", {"chat_id":channel,"user_id":str(user_id)})
         return member.get("status") in {"creator","administrator","member","restricted"}
     except Exception as exc:
         log.warning("force join check failed: %s", exc)
@@ -599,7 +673,8 @@ async def is_joined(user_id: int) -> bool:
 
 def join_keyboard() -> dict:
     rows = []
-    if FORCE_JOIN_URL: rows.append([{"text":"📢 عضویت در کانال","url":FORCE_JOIN_URL}])
+    url=force_join_url()
+    if url: rows.append([{"text":"📢 عضویت در کانال","url":url}])
     rows.append([{"text":"✅ عضو شدم · بررسی","callback_data":"joincheck"}])
     return {"inline_keyboard":rows}
 
@@ -845,28 +920,48 @@ async def send_one(job:dict[str,Any],user_id:int,chat_id:int,idx:int,quality:str
 
 
 async def send_spotify(job:dict[str,Any],user_id:int,chat_id:int):
+    tmp=Path(tempfile.mkdtemp(prefix="bluegate_spotify_"))
     try:
-        m = SPOTIFY_RE.search(job["source_url"])
+        m=SPOTIFY_RE.search(job["source_url"])
         if not m or m.group(1).lower() != "track":
-            raise RuntimeError("فعلاً در V4 فقط Spotify Track تکی پشتیبانی می‌شود.")
-        track_id = m.group(2)
-        await send_text(chat_id,"🟢 Spotify شناسایی شد؛ دارم ترک رو در YouTube Music پیدا می‌کنم…")
-        meta = await asyncio.to_thread(spotify_oembed_sync, job["source_url"])
-        title = str(meta.get("title") or job["result"].get("title") or "").strip()
-        artist = str(meta.get("author_name") or "").strip()
-        if not title:
-            raise RuntimeError("عنوان ترک Spotify پیدا نشد.")
-        query = f"{artist} - {title}" if artist and artist.lower() not in title.lower() else title
-        result = await fastsaver_search_music(query)
-        video_id = str(result["video_id"])
-        cache_key = f"spotify:{track_id}:{(await ensure_bot_username()).lower()}"
-        file_id = await fastsaver_audio_file_id(video_id, cache_key, title, "spotify")
-        await send_audio_file_id(chat_id, file_id, f"{html.escape(BRAND_NAME)} · Spotify · {html.escape(title)[:120]}")
-        record_download(user_id,job["job_id"],"audio","FastSaver TG file_id",0,"spotify")
-        await send_text(chat_id,"✅ Spotify Track ارسال شد.")
+            raise RuntimeError("فعلاً فقط Spotify Track تکی پشتیبانی می‌شود.")
+        await send_text(chat_id,"🟢 Spotify شناسایی شد؛ دارم نسخه متناظر رو پیدا می‌کنم…")
+        meta=await asyncio.to_thread(spotify_oembed_sync,job["source_url"])
+        title=str(meta.get("title") or job["result"].get("title") or "").strip()
+        artist=str(meta.get("author_name") or "").strip()
+        if not title: raise RuntimeError("عنوان ترک Spotify پیدا نشد.")
+        queries=[]
+        base=f"{artist} - {title}" if artist and artist.lower() not in title.lower() else title
+        for q in (base+" official audio",base+" topic",base):
+            if q not in queries: queries.append(q)
+        last=None
+        for q in queries:
+            try:
+                log.info("spotify-resolver: search=%r",q)
+                result=await fastsaver_search_music(q)
+                vid=str(result["video_id"])
+                yt_url=f"https://www.youtube.com/watch?v={vid}"
+                # Use the same proven /youtube/download path as normal YouTube, not tg-bot/fetch.
+                data=await fastsaver_json("POST","/youtube/download",payload={"url":yt_url,"format":"mp3"},timeout=FASTSAVER_TIMEOUT)
+                dl=data.get("download_url")
+                if not dl: raise RuntimeError("FastSaver MP3 download_url نداد.")
+                fn=re.sub(r"[^A-Za-z0-9._ -]+","_",str(data.get("filename") or f"{title}.mp3"))[:180]
+                if not fn.lower().endswith(".mp3"): fn += ".mp3"
+                path=tmp/fn
+                await download_url(str(dl),path)
+                ok=await send_file(chat_id,path,"audio",f"{html.escape(BRAND_NAME)} · Spotify · {html.escape(title)[:120]}")
+                if not ok: raise RuntimeError("Telegram فایل Spotify را ارسال نکرد.")
+                record_download(user_id,job["job_id"],"audio","FastSaver MP3",path.stat().st_size,"spotify")
+                await send_text(chat_id,"✅ Spotify Track ارسال شد.")
+                return
+            except Exception as exc:
+                last=exc; log.warning("spotify-resolver query failed: %s",exc)
+        raise RuntimeError(f"Spotify resolver failed: {last}")
     except Exception as exc:
-        log.exception("spotify-fastsaver failed")
+        log_error(user_id,"spotify",exc); log.exception("spotify-fastsaver failed")
         await send_text(chat_id,"❌ دانلود Spotify ناموفق بود.\n\n<code>"+html.escape(str(exc))[:900]+"</code>")
+    finally:
+        shutil.rmtree(tmp,ignore_errors=True)
 
 
 async def send_all(job:dict[str,Any],user_id:int,chat_id:int):
@@ -892,16 +987,87 @@ async def send_all(job:dict[str,Any],user_id:int,chat_id:int):
 
 
 def admin_keyboard() -> dict:
-    return {"inline_keyboard":[[{"text":"📊 آمار","callback_data":"adm|stats"},{"text":"👥 کاربران","callback_data":"adm|users"}],
-                               [{"text":"🧹 پاکسازی Jobها","callback_data":"adm|clean"}]]}
+    return {"inline_keyboard":[
+        [{"text":"📊 داشبورد","callback_data":"adm|stats"},{"text":"👥 کاربران","callback_data":"adm|users"}],
+        [{"text":"📢 Broadcast","callback_data":"adm|broadcast"},{"text":"🚫 Ban/Unban","callback_data":"adm|userfind"}],
+        [{"text":"🔌 سرویس‌ها","callback_data":"adm|services"},{"text":"🚦 محدودیت","callback_data":"adm|limit"}],
+        [{"text":"📢 Force Join","callback_data":"adm|forcejoin"},{"text":"🛠 Maintenance","callback_data":"adm|maintenance"}],
+        [{"text":"❌ خطاها","callback_data":"adm|errors"},{"text":"🩺 سیستم","callback_data":"adm|system"}],
+        [{"text":"🧹 پاکسازی Jobها","callback_data":"adm|clean"}]
+    ]}
+
+
+def services_keyboard() -> dict:
+    rows=[]
+    for p in ("instagram","youtube","twitter","soundcloud","spotify"):
+        on=service_enabled(p); rows.append([{"text":f"{'✅' if on else '❌'} {PLATFORM_LABELS[p]}","callback_data":f"admtoggle|{p}"}])
+    rows.append([{"text":"⬅️ برگشت","callback_data":"adm|stats"}])
+    return {"inline_keyboard":rows}
 
 
 async def send_admin_panel(chat_id:int):
     s=stats(); gb=s["bytes"]/(1024**3)
-    lines=["🛠 <b>BlueGate Downloader V4</b>","",f"👥 کاربران: <b>{s['users']}</b>",f"🟢 فعال ۲۴ ساعت: <b>{s['active24']}</b>",
-           f"📥 کل دانلودها: <b>{s['downloads']}</b>",f"⚡ دانلود ۲۴ ساعت: <b>{s['downloads24']}</b>",f"💾 حجم ارسال‌شده: <b>{gb:.2f} GB</b>","","📊 <b>پلتفرم‌ها</b>"]
+    with db() as conn:
+        banned=conn.execute("SELECT COUNT(*) c FROM bans").fetchone()["c"]
+        errors24=conn.execute("SELECT COUNT(*) c FROM error_logs WHERE created_at>=?",(now_ts()-86400,)).fetchone()["c"]
+    lines=["🛡 <b>BlueGate Admin · V4.1</b>","",f"👥 کاربران: <b>{s['users']}</b> · 🚫 بن: <b>{banned}</b>",f"🟢 فعال ۲۴h: <b>{s['active24']}</b>",f"📥 دانلود کل: <b>{s['downloads']}</b> · امروز: <b>{s['downloads24']}</b>",f"❌ خطای ۲۴h: <b>{errors24}</b>",f"💾 حجم: <b>{gb:.2f} GB</b>",f"🚦 سقف روزانه: <b>{daily_limit() or 'نامحدود'}</b>",f"🛠 Maintenance: <b>{'ON' if bool_setting('maintenance',False) else 'OFF'}</b>","","📊 <b>پلتفرم‌ها</b>"]
     for p,c in s["platforms"][:8]: lines.append(f"• {PLATFORM_LABELS.get(p,p)}: <b>{c}</b>")
     await send_text(chat_id,"\n".join(lines),admin_keyboard())
+
+
+async def admin_users(chat_id:int):
+    with db() as conn: rows=conn.execute("SELECT user_id,username,first_name,last_seen FROM users ORDER BY last_seen DESC LIMIT 20").fetchall()
+    lines=["👥 <b>۲۰ کاربر اخیر</b>",""]+[f"• @{html.escape(r['username']) if r['username'] else html.escape(r['first_name'] or '-') } · <code>{r['user_id']}</code>" for r in rows]
+    lines += ["","برای مدیریت یک نفر، دکمه Ban/Unban رو بزن و ID یا username رو بفرست."]
+    await send_text(chat_id,"\n".join(lines))
+
+
+async def admin_errors(chat_id:int):
+    with db() as conn: rows=conn.execute("SELECT id,user_id,platform,error,created_at FROM error_logs ORDER BY id DESC LIMIT 10").fetchall()
+    if not rows: return await send_text(chat_id,"✅ هنوز خطایی ثبت نشده.")
+    lines=["❌ <b>۱۰ خطای اخیر</b>",""]
+    for r in rows: lines.append(f"#{r['id']} · {PLATFORM_LABELS.get(r['platform'],r['platform'])} · <code>{r['user_id'] or '-'}</code>\n<code>{html.escape(r['error'])[:220]}</code>")
+    await send_text(chat_id,"\n\n".join(lines))
+
+
+async def admin_system(chat_id:int):
+    du=shutil.disk_usage('/tmp'); up=now_ts()-STARTED_AT
+    text=(f"🩺 <b>System Status</b>\n\n✅ Bot: Online\n⏱ Uptime: <b>{up//3600}h {(up%3600)//60}m</b>\n"
+          f"💽 /tmp free: <b>{du.free/(1024**3):.2f} GB</b>\n🗃 DB: <code>{html.escape(DB_PATH)}</code>\n"
+          f"⚡ FastSaver: <b>{'Configured' if FASTSAVER_API_KEY else 'Missing API key'}</b>\n📦 Version: <b>4.1</b>")
+    await send_text(chat_id,text)
+
+
+async def handle_admin_input(user_id:int,chat_id:int,text:str,state:tuple[str,str]) -> bool:
+    action,payload=state
+    if action=="broadcast":
+        with db() as conn: ids=[r[0] for r in conn.execute("SELECT user_id FROM users").fetchall()]
+        ok=fail=0; status=await send_text(chat_id,f"📢 ارسال برای {len(ids)} کاربر شروع شد…")
+        for uid in ids:
+            try: await send_text(uid,text); ok+=1
+            except Exception: fail+=1
+            await asyncio.sleep(.04)
+        await send_text(chat_id,f"✅ Broadcast تمام شد.\nموفق: <b>{ok}</b> · ناموفق: <b>{fail}</b>")
+        return True
+    if action=="userfind":
+        q=text.strip().lstrip('@')
+        with db() as conn:
+            row=conn.execute("SELECT * FROM users WHERE user_id=?",(int(q) if q.lstrip('-').isdigit() else -999999,)).fetchone() if q.lstrip('-').isdigit() else conn.execute("SELECT * FROM users WHERE lower(username)=lower(?)",(q,)).fetchone()
+        if not row: await send_text(chat_id,"❌ کاربر پیدا نشد."); return True
+        uid=row['user_id']; banned=is_banned(uid); cnt=user_downloads_today(uid)
+        kb={"inline_keyboard":[[{"text":"✅ Unban" if banned else "🚫 Ban","callback_data":f"adminban|{uid}|{0 if banned else 1}"}]]}
+        await send_text(chat_id,f"👤 <b>{html.escape(row['first_name'] or '')}</b> @{html.escape(row['username'] or '-')}\nID: <code>{uid}</code>\nدانلود ۲۴h: <b>{cnt}</b>\nوضعیت: <b>{'BANNED' if banned else 'ACTIVE'}</b>",kb); return True
+    if action=="limit":
+        try: n=max(0,int(text.strip())); set_setting('daily_limit',str(n)); await send_text(chat_id,f"✅ سقف روزانه شد <b>{n or 'نامحدود'}</b>.")
+        except: await send_text(chat_id,"❌ فقط عدد بفرست؛ 0 یعنی نامحدود.")
+        return True
+    if action=="forcejoin":
+        parts=[x.strip() for x in text.split('|',1)]; channel=parts[0]
+        url=parts[1] if len(parts)>1 else ''
+        if channel.lower() in {'off','0','خاموش'}: channel=''; url=''
+        set_setting('force_join_channel',channel); set_setting('force_join_url',url)
+        await send_text(chat_id,f"✅ Force Join {'خاموش شد' if not channel else 'تنظیم شد: <code>'+html.escape(channel)+'</code>'}"); return True
+    return False
 
 
 HELP_TEXT=(
@@ -919,6 +1085,14 @@ HELP_TEXT=(
 async def handle_message(message:dict[str,Any]):
     chat_id=message["chat"]["id"]; user=message.get("from",{}); user_id=user.get("id",chat_id); upsert_user(user)
     text=message.get("text") or message.get("caption") or ""
+    if user_id in ADMIN_IDS:
+        state=pop_admin_state(user_id)
+        if state and not text.startswith("/"):
+            if await handle_admin_input(user_id,chat_id,text,state): return
+    if user_id not in ADMIN_IDS and is_banned(user_id):
+        await send_text(chat_id,"⛔️ دسترسی شما به بات مسدود شده."); return
+    if user_id not in ADMIN_IDS and bool_setting("maintenance",False):
+        await send_text(chat_id,"🛠 بات موقتاً در حال بروزرسانیه. کمی بعد دوباره امتحان کن."); return
     if text.startswith("/start") or text.startswith("/help"):
         if not await ensure_joined(user_id,chat_id): return
         await send_text(chat_id,f"سلام 👋\nبه <b>{html.escape(BRAND_NAME)} V4</b> خوش اومدی.\n\n{HELP_TEXT}"+(f"\n\n🆘 @{html.escape(SUPPORT_USERNAME)}" if SUPPORT_USERNAME else ""))
@@ -932,6 +1106,11 @@ async def handle_message(message:dict[str,Any]):
     if not url:
         await send_text(chat_id,HELP_TEXT); return
     platform=detect_platform(url)
+    if not service_enabled(platform):
+        await send_text(chat_id,f"⛔️ سرویس {PLATFORM_LABELS.get(platform,platform)} فعلاً توسط ادمین غیرفعاله."); return
+    lim=daily_limit()
+    if user_id not in ADMIN_IDS and lim and user_downloads_today(user_id)>=lim:
+        await send_text(chat_id,f"🚦 سقف دانلود روزانه‌ات ({lim}) پر شده. فردا دوباره امتحان کن."); return
     if platform=="generic":
         await send_text(chat_id,"❌ این دامنه فعلاً در V4 فعال نیست. Instagram / YouTube / X / SoundCloud / Spotify رو بفرست."); return
     status=await send_text(chat_id,f"{PLATFORM_ICONS.get(platform,'🌐')} دارم لینک {PLATFORM_LABELS.get(platform,platform)} رو آنالیز می‌کنم…")
@@ -939,6 +1118,7 @@ async def handle_message(message:dict[str,Any]):
         result=await analyze(url); job_id=save_job(user_id,chat_id,url,result)
         await edit_text(chat_id,status["message_id"],result_text(result),build_keyboard(result,job_id))
     except Exception as exc:
+        log_error(user_id,platform,exc)
         log.exception("analyze failed")
         hints={"instagram":"اگر محتوا Private/Story باشه ممکنه Cookie لازم باشه.","youtube":"YouTube در V4 از FastSaver API استفاده می‌کند؛ API key و اعتبار حساب را بررسی کن.",
                "soundcloud":"SoundCloud گاهی extractor را موقتاً محدود می‌کند.","spotify":"Spotify در V4 از FastSaver + YouTube Music استفاده می‌کند؛ فعلاً Track تکی پشتیبانی می‌شود."}
@@ -959,15 +1139,31 @@ async def handle_callback(cb:dict[str,Any]):
             await safe_answer_callback(cb_id,"Access denied",True); return
         action=data.split("|",1)[1]; await safe_answer_callback(cb_id)
         if action=="clean":
-            with db() as conn:
-                count=conn.execute("SELECT COUNT(*) c FROM jobs").fetchone()["c"]; conn.execute("DELETE FROM jobs")
+            with db() as conn: count=conn.execute("SELECT COUNT(*) c FROM jobs").fetchone()["c"]; conn.execute("DELETE FROM jobs")
             await send_text(chat_id,f"🧹 <b>{count}</b> Job پاک شد.")
-        elif action=="users":
-            with db() as conn: rows=conn.execute("SELECT user_id,username,first_name FROM users ORDER BY last_seen DESC LIMIT 15").fetchall()
-            lines=["👥 <b>۱۵ کاربر اخیر</b>",""]+[f"• {html.escape(r['username'] or r['first_name'] or str(r['user_id']))} · <code>{r['user_id']}</code>" for r in rows]
-            await send_text(chat_id,"\n".join(lines))
+        elif action=="users": await admin_users(chat_id)
+        elif action=="services": await send_text(chat_id,"🔌 <b>سرویس‌ها</b>\nروی هر سرویس بزن تا روشن/خاموش بشه.",services_keyboard())
+        elif action=="broadcast": set_admin_state(user_id,"broadcast"); await send_text(chat_id,"📢 پیام Broadcast رو همین الان بفرست. HTML تلگرام هم قابل استفاده‌ست.")
+        elif action=="userfind": set_admin_state(user_id,"userfind"); await send_text(chat_id,"👤 Telegram ID یا username کاربر رو بفرست.")
+        elif action=="limit": set_admin_state(user_id,"limit"); await send_text(chat_id,f"🚦 سقف فعلی: <b>{daily_limit() or 'نامحدود'}</b>\nعدد جدید رو بفرست؛ 0 یعنی نامحدود.")
+        elif action=="forcejoin": set_admin_state(user_id,"forcejoin"); await send_text(chat_id,"📢 به این فرمت بفرست:\n<code>@Channel | https://t.me/Channel</code>\nبرای خاموش کردن: <code>off</code>")
+        elif action=="maintenance":
+            new=not bool_setting('maintenance',False); set_setting('maintenance','1' if new else '0'); await send_text(chat_id,f"🛠 Maintenance: <b>{'ON' if new else 'OFF'}</b>")
+        elif action=="errors": await admin_errors(chat_id)
+        elif action=="system": await admin_system(chat_id)
         else: await send_admin_panel(chat_id)
         return
+    if data.startswith("admtoggle|"):
+        if user_id not in ADMIN_IDS: await safe_answer_callback(cb_id,"Access denied",True); return
+        p=data.split("|",1)[1]; set_setting(f"service_{p}",'0' if service_enabled(p) else '1'); await safe_answer_callback(cb_id,"تغییر کرد ✅")
+        await edit_text(chat_id,message['message_id'],"🔌 <b>سرویس‌ها</b>\nروی هر سرویس بزن تا روشن/خاموش بشه.",services_keyboard()); return
+    if data.startswith("adminban|"):
+        if user_id not in ADMIN_IDS: await safe_answer_callback(cb_id,"Access denied",True); return
+        _,uid,b=data.split('|'); set_ban(int(uid),b=='1'); await safe_answer_callback(cb_id,"انجام شد ✅"); await send_text(chat_id,f"{'🚫 Ban' if b=='1' else '✅ Unban'}: <code>{uid}</code>"); return
+    if user_id not in ADMIN_IDS and is_banned(user_id):
+        await safe_answer_callback(cb_id,"دسترسی مسدود است.",True); return
+    if user_id not in ADMIN_IDS and bool_setting("maintenance",False):
+        await safe_answer_callback(cb_id,"بات در حال بروزرسانی است.",True); return
     if not await is_joined(user_id):
         await safe_answer_callback(cb_id,"اول عضو کانال شو.",True)
         if chat_id: await send_text(chat_id,"🔒 اول عضویتت رو تأیید کن.",join_keyboard())
@@ -1017,7 +1213,7 @@ async def root(): return PlainTextResponse(f"{BRAND_NAME} V4 is running ✅")
 
 
 @app.get("/health")
-async def health(): return JSONResponse({"ok":True,"version":"4.0","platforms":["instagram","youtube","twitter","soundcloud","spotify"],"youtube_provider":"FastSaverAPI","spotify_provider":"FastSaverAPI"})
+async def health(): return JSONResponse({"ok":True,"version":"4.1","platforms":["instagram","youtube","twitter","soundcloud","spotify"],"youtube_provider":"FastSaverAPI","spotify_provider":"FastSaverAPI"})
 
 
 @app.post("/telegram/{secret}")
