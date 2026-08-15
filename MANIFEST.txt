@@ -1,0 +1,14 @@
+BlueGate Downloader V3.3 FULL - File Manifest
+
+.env.example                521 bytes
+.gitignore                   83 bytes
+VERSION                       6 bytes
+requirements.txt            134 bytes
+main.py                   42632 bytes
+README.md                  1881 bytes
+render.yaml                 816 bytes
+Dockerfile                  943 bytes
+start.sh                    515 bytes
+
+main.py lines: 846
+Generated: 2026-08-15T22:36:30Z

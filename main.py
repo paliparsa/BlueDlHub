@@ -23,6 +23,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 logging.basicConfig(level=logging.INFO)
+# Avoid httpx logging full Telegram Bot API URLs (which contain the bot token).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("bluegate-downloader-v3")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -42,6 +45,9 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 JOB_TTL_HOURS = int(os.getenv("JOB_TTL_HOURS", "12"))
 SPOTIFY_ENABLED = os.getenv("SPOTIFY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 SPOTIFY_BITRATE = os.getenv("SPOTIFY_BITRATE", "128k").strip()
+YOUTUBE_POT_ENABLED = os.getenv("YOUTUBE_POT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+YOUTUBE_POT_BASE_URL = os.getenv("YOUTUBE_POT_BASE_URL", "http://127.0.0.1:4416").strip()
+YOUTUBE_PLAYER_CLIENT = os.getenv("YOUTUBE_PLAYER_CLIENT", "mweb").strip() or "mweb"
 
 def prepare_runtime_cookies() -> None:
     """Materialize base64-encoded Netscape cookies from Render secrets."""
@@ -63,7 +69,7 @@ if not BOT_TOKEN:
     log.warning("BOT_TOKEN is not set")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-app = FastAPI(title="BlueGate Multi Downloader V3.1")
+app = FastAPI(title="BlueGate Multi Downloader V3.3")
 loader = instaloader.Instaloader(download_pictures=False, download_videos=False, save_metadata=False, quiet=True)
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
@@ -199,25 +205,59 @@ def instagram_kind(url: str) -> str:
     return "unknown"
 
 
-def ydl_options(skip_download: bool = True, platform: str = "generic") -> dict[str, Any]:
+def ydl_options(skip_download: bool = True, platform: str = "generic", *, youtube_no_cookie: bool = False) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True, "no_warnings": True, "skip_download": skip_download,
-        "noplaylist": False, "socket_timeout": 30,
+        "noplaylist": False, "socket_timeout": 45,
         "extract_flat": False,
     }
     cookie = YOUTUBE_COOKIE_FILE if platform == "youtube" and YOUTUBE_COOKIE_FILE else COOKIE_FILE
-    if cookie and Path(cookie).exists():
+    if cookie and Path(cookie).exists() and not (platform == "youtube" and youtube_no_cookie):
         opts["cookiefile"] = cookie
+
+    # Current yt-dlp recommendation for challenged YouTube IPs: mweb + automatic PO-token provider.
+    # bgutil runs locally in this same Render container and generates a fresh token per video.
+    if platform == "youtube" and YOUTUBE_POT_ENABLED:
+        opts["extractor_args"] = {
+            "youtube": {"player_client": [YOUTUBE_PLAYER_CLIENT]},
+            "youtubepot-bgutilhttp": {"base_url": [YOUTUBE_POT_BASE_URL]},
+        }
     return opts
 
 
+def youtube_attempt_options(skip_download: bool = True) -> list[tuple[str, dict[str, Any]]]:
+    """Ordered YouTube strategies: POT with cookies, POT guest, then legacy cookie mode."""
+    attempts: list[tuple[str, dict[str, Any]]] = []
+    if YOUTUBE_POT_ENABLED:
+        attempts.append(("mweb+pot+cookies", ydl_options(skip_download, "youtube")))
+        attempts.append(("mweb+pot+guest", ydl_options(skip_download, "youtube", youtube_no_cookie=True)))
+    legacy = ydl_options(skip_download, "youtube")
+    legacy.pop("extractor_args", None)
+    attempts.append(("legacy+cookies", legacy))
+    return attempts
+
+
 def extract_yt_info(url: str, platform: str = "generic") -> dict[str, Any] | None:
-    try:
-        with yt_dlp.YoutubeDL(ydl_options(True, platform)) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception as exc:
-        log.warning("yt-dlp metadata failed %s: %s", url, exc)
-        return None
+    if platform != "youtube":
+        try:
+            with yt_dlp.YoutubeDL(ydl_options(True, platform)) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception as exc:
+            log.warning("yt-dlp metadata failed %s: %s", url, exc)
+            return None
+
+    last_exc: Exception | None = None
+    for name, opts in youtube_attempt_options(True):
+        try:
+            log.info("youtube-engine: metadata attempt=%s", name)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception as exc:
+            last_exc = exc
+            log.warning("youtube-engine: metadata attempt=%s failed: %s", name, exc)
+    if last_exc:
+        log.warning("yt-dlp metadata failed after all YouTube strategies: %s", last_exc)
+    return None
 
 
 def flatten_entries(info: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -532,16 +572,13 @@ def download_audio_sync(source_url: str, playlist_index: int, bitrate: str, outd
 
 
 def download_spotify_sync(source_url: str, outdir: Path) -> list[Path]:
-    """Resolve a Spotify track via public oEmbed metadata and download a matching audio source with yt-dlp.
-
-    This intentionally avoids spawning spotDL on small Render instances.
-    """
+    """Resolve one Spotify track and download matched audio using the hardened YouTube engine."""
     m = SPOTIFY_RE.search(source_url)
     if not m:
         raise RuntimeError("لینک Spotify معتبر نیست.")
     kind = m.group(1).lower()
     if kind != "track":
-        raise RuntimeError("در حالت Spotify Lite فعلاً دانلود مستقیم Track فعال است؛ Album/Playlist را در نسخه بعدی صف‌بندی می‌کنیم.")
+        raise RuntimeError("فعلاً Spotify Track تکی پشتیبانی می‌شود؛ Album/Playlist هنوز فعال نیست.")
 
     log.info("spotify-lite: fetching oEmbed metadata")
     meta = spotify_oembed_sync(source_url)
@@ -549,42 +586,45 @@ def download_spotify_sync(source_url: str, outdir: Path) -> list[Path]:
     if not title:
         raise RuntimeError("Spotify metadata پیدا نشد؛ لینک را دوباره بررسی کن.")
 
-    # Spotify's oEmbed title is enough to form a search query; prefer official/audio matches.
     query = f"ytsearch3:{title} official audio"
-    log.info("spotify-lite: searching YouTube for %r", title)
-    opts = ydl_options(False, "youtube")
-    opts.update({
-        "outtmpl": str(outdir/"%(title).140B.%(ext)s"),
-        "restrictfilenames": True,
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "playlistend": 3,
-        "postprocessors": [{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":SPOTIFY_BITRATE.rstrip("k")}],
-    })
-    before=set(outdir.rglob("*"))
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-            entries = [e for e in (info or {}).get("entries", []) if e]
-            if not entries:
-                raise RuntimeError("هیچ نتیجه‌ای در YouTube برای این ترک پیدا نشد.")
-            # Download the first result returned by yt-dlp search.
-            chosen = entries[0]
-            chosen_url = chosen.get("webpage_url") or chosen.get("url")
-            if not chosen_url:
-                raise RuntimeError("نتیجه YouTube URL قابل دانلود نداشت.")
-            log.info("spotify-lite: downloading matched source id=%s title=%r", chosen.get("id"), chosen.get("title"))
-            ydl.extract_info(chosen_url, download=True)
-    except Exception as exc:
-        raise RuntimeError(f"Spotify Lite / YouTube failed: {exc}") from exc
+    last_exc: Exception | None = None
+    for attempt_name, base_opts in youtube_attempt_options(False):
+        opts = dict(base_opts)
+        opts.update({
+            "outtmpl": str(outdir/"%(title).140B.%(ext)s"),
+            "restrictfilenames": True,
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "playlistend": 3,
+            "postprocessors": [{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":SPOTIFY_BITRATE.rstrip("k")}],
+        })
+        before = set(outdir.rglob("*"))
+        try:
+            log.info("spotify-lite: YouTube attempt=%s query=%r", attempt_name, title)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(query, download=False)
+                entries = [e for e in (info or {}).get("entries", []) if e]
+                if not entries:
+                    raise RuntimeError("هیچ نتیجه‌ای در YouTube برای این ترک پیدا نشد.")
+                chosen = entries[0]
+                chosen_url = chosen.get("webpage_url") or chosen.get("url")
+                if not chosen_url:
+                    raise RuntimeError("نتیجه YouTube URL قابل دانلود نداشت.")
+                log.info("spotify-lite: attempt=%s matched id=%s title=%r", attempt_name, chosen.get("id"), chosen.get("title"))
+                ydl.extract_info(chosen_url, download=True)
+            files=[p for p in outdir.rglob("*.mp3") if p.is_file() and p not in before]
+            if not files:
+                files=[p for p in outdir.rglob("*.mp3") if p.is_file()]
+            if files:
+                chosen_file=max(files, key=lambda p:p.stat().st_mtime)
+                log.info("spotify-lite: mp3 ready via %s: %s", attempt_name, chosen_file.name)
+                return [chosen_file]
+            raise RuntimeError("YouTube اجرا شد ولی FFmpeg خروجی MP3 نساخت.")
+        except Exception as exc:
+            last_exc = exc
+            log.warning("spotify-lite: attempt=%s failed: %s", attempt_name, exc)
 
-    files=[p for p in outdir.rglob("*.mp3") if p.is_file() and p not in before]
-    if not files:
-        files=[p for p in outdir.rglob("*.mp3") if p.is_file()]
-    if not files:
-        raise RuntimeError("YouTube دانلود شد ولی خروجی MP3 ساخته نشد؛ FFmpeg/format را بررسی کن.")
-    log.info("spotify-lite: mp3 ready %s", files[0].name)
-    return [max(files, key=lambda p:p.stat().st_mtime)]
+    raise RuntimeError(f"Spotify Lite / YouTube failed after all strategies: {last_exc}")
 
 
 async def prepare_media(job: dict[str,Any], idx: int, quality: str, mode: str, tmp: Path) -> tuple[Path,str,str]:
@@ -790,7 +830,7 @@ async def root(): return PlainTextResponse(f"{BRAND_NAME} V3 is running ✅")
 
 
 @app.get("/health")
-async def health(): return JSONResponse({"ok":True,"version":"3.2","platforms":["instagram","youtube","twitter","soundcloud","spotify"]})
+async def health(): return JSONResponse({"ok":True,"version":"3.3","platforms":["instagram","youtube","twitter","soundcloud","spotify"]})
 
 
 @app.post("/telegram/{secret}")

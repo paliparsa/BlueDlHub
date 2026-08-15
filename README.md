@@ -1,84 +1,48 @@
-# BlueGate Multi Downloader Bot — V3
+# BlueGate Downloader V3.3 — YouTube PO Token Edition
 
-A Telegram webhook bot that auto-detects supported links and offers the appropriate media/audio download options.
+V3.3 keeps the V3.2 Telegram downloader and adds an automatic YouTube PO-token provider for Render/datacenter IPs.
 
 ## Supported platforms
+- Instagram
+- YouTube / YouTube Music
+- X / Twitter
+- SoundCloud
+- Spotify Track (resolved through the hardened YouTube engine)
 
-- Instagram — Post, Reel, Carousel, Story, Highlight
-- YouTube — Videos, Shorts, playlists; video quality + MP3 extraction
-- X / Twitter — video/GIF/media supported by yt-dlp
-- SoundCloud — tracks/sets supported by yt-dlp; MP3 output
-- Spotify — Track / Album / Playlist through Spotify Lite resolver (Spotify metadata + matched audio source)
+## What changed in V3.3
+- `bgutil-ytdlp-pot-provider` 1.3.1 installed as a yt-dlp plugin.
+- A local BgUtils provider starts inside the same Render container on `127.0.0.1:4416`.
+- YouTube extraction defaults to the `mweb` client with automatic PO tokens.
+- YouTube tries three strategies: `mweb+POT+cookies`, `mweb+POT guest`, then legacy cookies.
+- Spotify Lite uses the same hardened YouTube engine.
+- `httpx` request logging is reduced so Telegram bot tokens are not printed in ordinary INFO logs.
+- Render health-check `HEAD /` remains supported.
 
-## V3 highlights
+## Render deployment
+Replace the files in the existing GitHub repository with the contents of this folder and deploy the latest commit. Keep your existing environment variables.
 
-- Automatic platform detection
-- Video quality buttons (when yt-dlp exposes multiple heights)
-- MP3 128 / 192 / 320 target encoding for sources that contain audio
-- Download All for multi-item yt-dlp results
-- Spotify flow separated from normal yt-dlp jobs
-- Playlist cap via `MAX_PLAYLIST_ITEMS`
-- Platform-aware admin statistics
-- Force Join, Job IDs, SQLite analytics, cleanup and upload-size guard retained from V2
-- Webhook-first design for Render and similar hosts
-
-## Important Spotify note
-
-Spotify itself is not being decrypted or ripped. Spotify Lite resolver uses Spotify links/metadata and finds a matching audio source (normally YouTube Music), then writes Spotify metadata/artwork to the output. Actual source quality can be lower than an MP3 target bitrate. Spotify Lite resolver's current docs state the normal source ceiling is around 128 kbps unless an eligible YouTube Music Premium setup is used.
-
-## Commands
-
-- `/start` or `/help`
-- `/admin`
-- `/stats`
-
-## Required environment variables
+Recommended environment variables:
 
 ```env
-BOT_TOKEN=123456789:YOUR_BOT_TOKEN
+BOT_TOKEN=...
 WEBHOOK_URL=https://YOUR-SERVICE.onrender.com
-WEBHOOK_SECRET=a-long-random-secret
-```
-
-Recommended:
-
-```env
-MAX_SEND_MB=49
-MAX_PLAYLIST_ITEMS=10
-BRAND_NAME=BlueGate Downloader
-SUPPORT_USERNAME=BlueGateSupport
-ADMIN_IDS=123456789
-DB_PATH=/tmp/bluegate_downloader.db
-JOB_TTL_HOURS=12
+WEBHOOK_SECRET=...
+ADMIN_IDS=...
+YOUTUBE_COOKIES_B64=...
+YOUTUBE_POT_ENABLED=true
+YOUTUBE_POT_BASE_URL=http://127.0.0.1:4416
+YOUTUBE_PLAYER_CLIENT=mweb
 SPOTIFY_ENABLED=true
 SPOTIFY_BITRATE=128k
 ```
 
-Optional cookies:
+Do not upload `cookies.txt`, bot tokens, or secrets to GitHub.
 
-```env
-COOKIE_FILE=/app/cookies.txt
-YOUTUBE_COOKIE_FILE=/app/youtube_cookies.txt
-```
+## Expected startup clues
+The Render log should show the BgUtils provider starting before Uvicorn. During a YouTube/Spotify request, application logs use markers such as:
 
-Never commit live cookies or bot tokens to GitHub.
+- `youtube-engine: metadata attempt=mweb+pot+cookies`
+- `spotify-lite: YouTube attempt=mweb+pot+cookies`
+- fallback to `mweb+pot+guest` if necessary
 
-## Deploy / update from V2 on Render
-
-1. Replace the V2 repository files with the V3 files.
-2. Commit/push to the branch connected to Render.
-3. Add new env vars `MAX_PLAYLIST_ITEMS`, `SPOTIFY_ENABLED`, `SPOTIFY_BITRATE` if desired.
-4. Render rebuilds the Docker image automatically when Auto-Deploy is enabled.
-5. Existing `BOT_TOKEN`, webhook URL, admins and Force Join settings can remain unchanged.
-6. Test `/health`; it should report version `3`.
-7. Send `/start`, then test one link from each platform.
-
-`spotdl` is installed from `requirements.txt`; ffmpeg is supplied by the Dockerfile.
-
-## Resource warning on free hosting
-
-YouTube video merging, MP3 transcoding and Spotify matching can use much more CPU/RAM/network than the Instagram-only bot. Keep `MAX_PLAYLIST_ITEMS` conservative on a free instance. Very large downloads are rejected before Telegram upload based on `MAX_SEND_MB`.
-
-## Legal / usage
-
-Use the bot only for media you have the right or permission to download and reuse. Some services may require account cookies for content you are authorized to access. Platform changes can temporarily break extractors; keeping yt-dlp/Spotify Lite resolver current is important.
+Providing PO tokens improves compatibility with YouTube challenges but cannot guarantee every datacenter IP will be accepted by YouTube.
