@@ -69,7 +69,7 @@ USER_JOB_COOLDOWN = max(0, int(os.getenv("USER_JOB_COOLDOWN", "3")))
 QUEUE_MAX_RETRIES = max(0, int(os.getenv("QUEUE_MAX_RETRIES", "2")))
 SMART_CACHE_TTL_DAYS = max(1, int(os.getenv("SMART_CACHE_TTL_DAYS", "90")))
 FASTSAVER_HEALTH_INTERVAL = max(60, int(os.getenv("FASTSAVER_HEALTH_INTERVAL", "600")))
-BATCH_MAX_LINKS = max(2, min(25, int(os.getenv("BATCH_MAX_LINKS", "10"))))
+BATCH_MAX_LINKS = max(2, min(25, int(os.getenv("BATCH_MAX_LINKS", "25"))))
 
 def prepare_runtime_cookies() -> None:
     """Materialize base64-encoded Netscape cookies from Render secrets."""
@@ -304,12 +304,58 @@ def init_db():
             max_active_jobs INTEGER NOT NULL DEFAULT -1, cooldown INTEGER NOT NULL DEFAULT -1,
             updated_at BIGINT NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS plans (
+            plan_id TEXT PRIMARY KEY, name TEXT NOT NULL, icon TEXT NOT NULL DEFAULT '⭐',
+            sort_order INTEGER NOT NULL DEFAULT 100, active INTEGER NOT NULL DEFAULT 1, created_at BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS plan_permissions (
+            plan_id TEXT PRIMARY KEY, daily_limit INTEGER NOT NULL DEFAULT 20,
+            max_active_jobs INTEGER NOT NULL DEFAULT 2, cooldown INTEGER NOT NULL DEFAULT 5,
+            batch_limit INTEGER NOT NULL DEFAULT 3, queue_priority INTEGER NOT NULL DEFAULT 100,
+            youtube_max_height INTEGER NOT NULL DEFAULT 720, youtube_daily_limit INTEGER NOT NULL DEFAULT 10,
+            spotify_daily_limit INTEGER NOT NULL DEFAULT 5, allow_best INTEGER NOT NULL DEFAULT 0,
+            updated_at BIGINT NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS user_subscriptions (
+            user_id BIGINT PRIMARY KEY, plan_id TEXT NOT NULL, starts_at BIGINT NOT NULL,
+            expires_at BIGINT NOT NULL DEFAULT 0, source TEXT, updated_at BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS redeem_codes (
+            code TEXT PRIMARY KEY, plan_id TEXT NOT NULL, duration_days INTEGER NOT NULL,
+            max_uses INTEGER NOT NULL DEFAULT 1, used_count INTEGER NOT NULL DEFAULT 0,
+            expires_at BIGINT NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+            created_by BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS redeem_uses (
+            use_id TEXT PRIMARY KEY, code TEXT NOT NULL, user_id BIGINT NOT NULL, used_at BIGINT NOT NULL,
+            UNIQUE(code,user_id)
+        );
+        CREATE TABLE IF NOT EXISTS referrals (
+            referred_user_id BIGINT PRIMARY KEY, referrer_user_id BIGINT NOT NULL, created_at BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS campaigns (
+            campaign_id TEXT PRIMARY KEY, name TEXT NOT NULL, starts_at BIGINT NOT NULL, ends_at BIGINT NOT NULL,
+            daily_bonus INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
+            created_by BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS admin_audit_log (
+            audit_id TEXT PRIMARY KEY, admin_id BIGINT NOT NULL, action TEXT NOT NULL, target TEXT, details TEXT, created_at BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS subscription_events (
+            event_id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, event TEXT NOT NULL, payload TEXT, created_at BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS subscription_notices (
+            user_id BIGINT NOT NULL, expires_at BIGINT NOT NULL, notice_type TEXT NOT NULL, sent_at BIGINT NOT NULL,
+            PRIMARY KEY(user_id,expires_at,notice_type)
+        );
         """)
         # A crashed Render deploy must not leave jobs permanently in running state.
         conn.execute("UPDATE queue_jobs SET status='waiting', started_at=0 WHERE status='running'")
         conn.execute("DELETE FROM queue_subscribers WHERE queue_id IN (SELECT queue_id FROM queue_jobs WHERE status IN ('done','failed','cancelled') AND finished_at < ?)", (now_ts()-7*86400,))
         conn.execute("DELETE FROM smart_cache WHERE updated_at < ?", (now_ts()-SMART_CACHE_TTL_DAYS*86400,))
         conn.execute("DELETE FROM jobs WHERE created_at < ?", (now_ts() - JOB_TTL_HOURS * 3600,))
+
+    seed_v5_defaults()
 
     # Backwards compatibility: the old single Render key becomes pool key #1 once.
     if FASTSAVER_API_KEY:
@@ -499,15 +545,20 @@ def reset_user_overrides(user_id:int) -> None:
 
 def effective_daily_limit(user_id:int) -> int:
     v=get_user_override(user_id)["daily_limit"]
-    return daily_limit() if v < 0 else max(0,v)
+    if v >= 0: return max(0,v)
+    base=int(get_plan_permissions(user_id).get("daily_limit",daily_limit()))
+    if base == 0: return 0
+    return max(0,base + active_campaign_daily_bonus())
 
 def effective_max_active(user_id:int) -> int:
     v=get_user_override(user_id)["max_active_jobs"]
-    return MAX_ACTIVE_JOBS_PER_USER if v < 0 else max(1,v)
+    if v >= 0: return max(1,v)
+    return max(1,int(get_plan_permissions(user_id).get("max_active_jobs",MAX_ACTIVE_JOBS_PER_USER)))
 
 def effective_cooldown(user_id:int) -> int:
     v=get_user_override(user_id)["cooldown"]
-    return USER_JOB_COOLDOWN if v < 0 else max(0,v)
+    if v >= 0: return max(0,v)
+    return max(0,int(get_plan_permissions(user_id).get("cooldown",USER_JOB_COOLDOWN)))
 
 def add_favorite(user_id:int, row:Any) -> str:
     fid=secrets.token_urlsafe(7).replace("-","").replace("_","")[:9]
@@ -1281,6 +1332,11 @@ async def ensure_joined(user_id: int, chat_id: int) -> bool:
 def build_keyboard(result: dict[str, Any], job_id: str) -> dict:
     rows: list[list[dict[str,str]]] = []
     platform = result.get("platform", "generic")
+    owner_id=0
+    try:
+        j=load_job(job_id); owner_id=int(j["user_id"]) if j else 0
+    except Exception: pass
+    yt_max=0 if owner_id in ADMIN_IDS else int(get_plan_permissions(owner_id).get("youtube_max_height",0) or 0) if owner_id else 0
     if platform == "spotify":
         rows.append([{"text":"🎧 دانلود آهنگ","callback_data":f"sp|{job_id}"}])
     elif platform == "music":
@@ -1302,13 +1358,18 @@ def build_keyboard(result: dict[str, Any], job_id: str) -> dict:
                 ])
             elif item["type"] == "video":
                 qs=item.get("qualities") or []
+                if platform=="youtube" and yt_max:
+                    qs=[q for q in qs if str(q).isdigit() and int(q)<=yt_max]
                 chunk=[]
                 for q in qs[:6]:
                     chunk.append({"text":f"🎬 {q}p","callback_data":f"d|{job_id}|v|{idx}|{q}"})
                     if len(chunk)==3: rows.append(chunk); chunk=[]
                 if chunk: rows.append(chunk)
                 if not qs:
-                    rows.append([{"text":f"🎬 ویدیو{title_idx} · Best","callback_data":f"d|{job_id}|v|{idx}|b"}])
+                    if platform=="youtube" and yt_max:
+                        rows.append([{"text":f"🎬 ویدیو{title_idx} · {yt_max}p","callback_data":f"d|{job_id}|v|{idx}|{yt_max}"}])
+                    else:
+                        rows.append([{"text":f"🎬 ویدیو{title_idx} · Best","callback_data":f"d|{job_id}|v|{idx}|b"}])
                 if item.get("has_audio"):
                     rows.append([{"text":f"🎧 فقط صدا{title_idx}","callback_data":f"a|{job_id}|{idx}|128"}])
         if len(result.get("media") or []) > 1:
@@ -1581,6 +1642,278 @@ async def send_all(job:dict[str,Any],user_id:int,chat_id:int,status_message_id:i
 
 
 
+
+# ========================= V5 Membership & Growth =========================
+DEFAULT_PLANS = {
+    "free": {"name":"Free","icon":"🆓","sort":10,"daily":20,"active":2,"cooldown":5,"batch":3,"priority":100,"yt_height":720,"yt_daily":10,"sp_daily":5,"best":0},
+    "vip": {"name":"VIP","icon":"⭐","sort":20,"daily":100,"active":5,"cooldown":1,"batch":10,"priority":50,"yt_height":1080,"yt_daily":80,"sp_daily":30,"best":0},
+    "premium": {"name":"Premium","icon":"💎","sort":30,"daily":0,"active":10,"cooldown":0,"batch":25,"priority":10,"yt_height":0,"yt_daily":0,"sp_daily":0,"best":1},
+}
+
+def seed_v5_defaults() -> None:
+    with db() as conn:
+        for pid,cfg in DEFAULT_PLANS.items():
+            conn.execute("INSERT INTO plans(plan_id,name,icon,sort_order,active,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(plan_id) DO NOTHING",
+                         (pid,cfg["name"],cfg["icon"],cfg["sort"],1,now_ts()))
+            conn.execute("""INSERT INTO plan_permissions(plan_id,daily_limit,max_active_jobs,cooldown,batch_limit,queue_priority,youtube_max_height,youtube_daily_limit,spotify_daily_limit,allow_best,updated_at)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(plan_id) DO NOTHING""",
+                         (pid,cfg["daily"],cfg["active"],cfg["cooldown"],cfg["batch"],cfg["priority"],cfg["yt_height"],cfg["yt_daily"],cfg["sp_daily"],cfg["best"],now_ts()))
+        defaults={"referral_reward_every":"3","referral_reward_days":"1","referral_reward_plan":"vip"}
+        for k,v in defaults.items(): conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",(k,v))
+
+def plan_row(plan_id:str):
+    with db() as conn: return conn.execute("SELECT * FROM plans WHERE plan_id=?",(plan_id,)).fetchone()
+
+def plan_permissions_by_id(plan_id:str) -> dict[str,int]:
+    with db() as conn: row=conn.execute("SELECT * FROM plan_permissions WHERE plan_id=?",(plan_id,)).fetchone()
+    data=dict(row) if row else {}
+    keys=("daily_limit","max_active_jobs","cooldown","batch_limit","queue_priority","youtube_max_height","youtube_daily_limit","spotify_daily_limit","allow_best")
+    return {k:int(data.get(k) or 0) for k in keys}
+
+def current_subscription(user_id:int) -> dict[str,Any]:
+    now=now_ts()
+    with db() as conn: row=conn.execute("SELECT * FROM user_subscriptions WHERE user_id=?",(user_id,)).fetchone()
+    pid="free"; expires=0; source="default"
+    if row and (int(row["expires_at"] or 0)==0 or int(row["expires_at"])>now):
+        p=plan_row(str(row["plan_id"]))
+        if p and int(p["active"] or 0): pid=str(row["plan_id"]); expires=int(row["expires_at"] or 0); source=str(row["source"] or "")
+    p=plan_row(pid) or {"plan_id":"free","name":"Free","icon":"🆓"}
+    return {"plan_id":pid,"name":p["name"],"icon":p["icon"],"expires_at":expires,"source":source}
+
+def get_plan_permissions(user_id:int) -> dict[str,int]:
+    return plan_permissions_by_id(current_subscription(user_id)["plan_id"])
+
+def plan_list(active_only:bool=True):
+    with db() as conn:
+        sql="SELECT * FROM plans"+(" WHERE active=1" if active_only else "")+" ORDER BY sort_order,plan_id"
+        return conn.execute(sql).fetchall()
+
+def grant_subscription(user_id:int,plan_id:str,duration_days:int,source:str="admin") -> int:
+    if not plan_row(plan_id): raise ValueError("unknown plan")
+    now=now_ts(); cur=current_subscription(user_id); base=now; cur_exp=int(cur["expires_at"] or 0)
+    if source.startswith(("redeem:","referral")) and cur["plan_id"]!="free" and (cur_exp==0 or cur_exp>now):
+        current_row=plan_row(cur["plan_id"]); incoming_row=plan_row(plan_id)
+        if current_row and incoming_row and int(current_row["sort_order"] or 0)>int(incoming_row["sort_order"] or 0): plan_id=cur["plan_id"]
+    if cur["plan_id"]==plan_id and cur["plan_id"]!="free" and cur_exp==0:
+        expires=0
+    else:
+        if cur["plan_id"]==plan_id and cur_exp>now: base=cur_exp
+        expires=0 if duration_days<=0 else base+int(duration_days)*86400
+    with db() as conn:
+        if plan_id=="free": conn.execute("DELETE FROM user_subscriptions WHERE user_id=?",(user_id,)); expires=0
+        else:
+            conn.execute("""INSERT INTO user_subscriptions(user_id,plan_id,starts_at,expires_at,source,updated_at) VALUES(?,?,?,?,?,?)
+                            ON CONFLICT(user_id) DO UPDATE SET plan_id=excluded.plan_id,starts_at=excluded.starts_at,expires_at=excluded.expires_at,source=excluded.source,updated_at=excluded.updated_at""",
+                         (user_id,plan_id,now,expires,source,now))
+        conn.execute("INSERT INTO subscription_events(event_id,user_id,event,payload,created_at) VALUES(?,?,?,?,?)",
+                     (secrets.token_hex(8),user_id,"grant",json.dumps({"plan":plan_id,"days":duration_days,"source":source},ensure_ascii=False),now))
+    return expires
+
+def format_remaining(expires:int) -> str:
+    if not expires: return "∞"
+    sec=max(0,expires-now_ts()); days=sec//86400; hours=(sec%86400)//3600
+    return f"{days}d {hours}h"
+
+def active_campaign_daily_bonus() -> int:
+    n=now_ts()
+    with db() as conn:
+        row=conn.execute("SELECT COALESCE(SUM(daily_bonus),0) b FROM campaigns WHERE active=1 AND starts_at<=? AND ends_at>?",(n,n)).fetchone()
+    return int(row["b"] or 0)
+
+def effective_batch_limit(user_id:int) -> int:
+    return max(1,min(BATCH_MAX_LINKS,int(get_plan_permissions(user_id).get("batch_limit",BATCH_MAX_LINKS) or BATCH_MAX_LINKS)))
+
+def platform_downloads_today(user_id:int,platform:str) -> int:
+    with db() as conn:
+        return int(conn.execute("SELECT COUNT(*) c FROM downloads WHERE user_id=? AND platform=? AND created_at>=?",(user_id,platform,now_ts()-86400)).fetchone()["c"] or 0)
+
+def plan_platform_limit(user_id:int,platform:str) -> int:
+    perm=get_plan_permissions(user_id)
+    return int(perm.get("spotify_daily_limit",0) if platform=="spotify" else perm.get("youtube_daily_limit",0) if platform=="youtube" else 0)
+
+def plan_access_error(user_id:int,platform:str) -> str|None:
+    if user_id in ADMIN_IDS: return None
+    lim=effective_daily_limit(user_id)
+    if lim and user_downloads_today(user_id)>=lim: return ux(user_id,f"🚦 سقف روزانه پلنت ({lim}) پر شده.",f"🚦 Your plan's daily limit ({lim}) has been reached.")
+    plim=plan_platform_limit(user_id,platform)
+    if plim and platform_downloads_today(user_id,platform)>=plim:
+        return ux(user_id,f"🚦 سقف روزانه {PLATFORM_LABELS.get(platform,platform)} در پلنت ({plim}) پر شده.",f"🚦 Your daily {PLATFORM_LABELS.get(platform,platform)} allowance ({plim}) has been reached.")
+    return None
+
+def create_redeem_code(plan_id:str,duration_days:int,max_uses:int,expires_days:int,created_by:int) -> str:
+    if not plan_row(plan_id): raise ValueError("unknown plan")
+    code=f"BG-{plan_id[:3].upper()}-{secrets.token_hex(3).upper()}"
+    exp=0 if expires_days<=0 else now_ts()+expires_days*86400
+    with db() as conn:
+        conn.execute("INSERT INTO redeem_codes(code,plan_id,duration_days,max_uses,used_count,expires_at,enabled,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (code,plan_id,duration_days,max_uses,0,exp,1,created_by,now_ts()))
+    audit_admin(created_by,"code.create",code,{"plan":plan_id,"days":duration_days,"uses":max_uses})
+    return code
+
+def redeem_subscription_code(user_id:int,code:str) -> tuple[bool,str]:
+    code=code.strip().upper()
+    with db() as conn: row=conn.execute("SELECT * FROM redeem_codes WHERE upper(code)=?",(code,)).fetchone()
+    if not row or not int(row["enabled"] or 0): return False,"invalid"
+    if int(row["expires_at"] or 0) and int(row["expires_at"])<=now_ts(): return False,"expired"
+    with db() as conn:
+        old=conn.execute("SELECT 1 FROM redeem_uses WHERE code=? AND user_id=?",(row["code"],user_id)).fetchone()
+    if old: return False,"already_used"
+    if int(row["max_uses"] or 0)>0 and int(row["used_count"] or 0)>=int(row["max_uses"]): return False,"used_up"
+    with db() as conn:
+        conn.execute("INSERT INTO redeem_uses(use_id,code,user_id,used_at) VALUES(?,?,?,?)",(secrets.token_hex(8),row["code"],user_id,now_ts()))
+        conn.execute("UPDATE redeem_codes SET used_count=used_count+1 WHERE code=?",(row["code"],))
+    grant_subscription(user_id,str(row["plan_id"]),int(row["duration_days"]),f"redeem:{row['code']}")
+    return True,str(row["plan_id"])
+
+def audit_admin(admin_id:int,action:str,target:str="",details:Any=None) -> None:
+    try:
+        payload=details if isinstance(details,str) else json.dumps(details or {},ensure_ascii=False)
+        with db() as conn: conn.execute("INSERT INTO admin_audit_log(audit_id,admin_id,action,target,details,created_at) VALUES(?,?,?,?,?,?)",(secrets.token_hex(8),admin_id,action,target,payload[:1500],now_ts()))
+    except Exception as exc: log.warning("audit log: %s",exc)
+
+def register_referral(referred_id:int,referrer_id:int) -> bool:
+    if referred_id==referrer_id or referrer_id<=0: return False
+    with db() as conn:
+        exists=conn.execute("SELECT 1 FROM referrals WHERE referred_user_id=?",(referred_id,)).fetchone()
+        ref_exists=conn.execute("SELECT 1 FROM users WHERE user_id=?",(referrer_id,)).fetchone()
+        if exists or not ref_exists: return False
+        conn.execute("INSERT INTO referrals(referred_user_id,referrer_user_id,created_at) VALUES(?,?,?)",(referred_id,referrer_id,now_ts()))
+        count=int(conn.execute("SELECT COUNT(*) c FROM referrals WHERE referrer_user_id=?",(referrer_id,)).fetchone()["c"] or 0)
+    every=max(1,int(get_setting("referral_reward_every","3") or 3)); days=max(1,int(get_setting("referral_reward_days","1") or 1)); pid=get_setting("referral_reward_plan","vip") or "vip"
+    if count % every == 0:
+        grant_subscription(referrer_id,pid,days,"referral")
+        try:
+            loop=asyncio.get_running_loop(); loop.create_task(send_text(referrer_id,f"🎁 <b>پاداش دعوت فعال شد</b>\n{days} روز {html.escape((plan_row(pid) or {'name':pid})['name'])} به حسابت اضافه شد."))
+        except RuntimeError: pass
+    return True
+
+def referral_count(user_id:int) -> int:
+    with db() as conn: return int(conn.execute("SELECT COUNT(*) c FROM referrals WHERE referrer_user_id=?",(user_id,)).fetchone()["c"] or 0)
+
+async def send_subscription_page(chat_id:int,user_id:int):
+    sub=current_subscription(user_id); perm=get_plan_permissions(user_id); st=user_download_stats(user_id); lim=effective_daily_limit(user_id)
+    remain="∞" if not lim else max(0,lim-st["today"]); expiry="∞" if not sub["expires_at"] else format_remaining(sub["expires_at"])
+    text=(f"{sub['icon']} <b>{html.escape(sub['name'])}</b>\n\n⏳ اعتبار: <b>{expiry}</b>\n📥 امروز: <b>{st['today']}</b> / <b>{lim or '∞'}</b> · باقی‌مانده <b>{remain}</b>\n"
+          f"📚 Batch: <b>{perm.get('batch_limit',0)}</b> · ⚡ Priority: <b>{perm.get('queue_priority',100)}</b>\n"
+          f"▶️ YouTube max: <b>{'Best' if not perm.get('youtube_max_height') else str(perm.get('youtube_max_height'))+'p'}</b>\n"
+          f"🟢 Spotify/day: <b>{perm.get('spotify_daily_limit') or '∞'}</b>")
+    kb={"inline_keyboard":[[{"text":"🎟 فعال‌سازی کد","callback_data":"sub|redeem"},{"text":"📋 پلن‌ها","callback_data":"sub|plans"}],
+                           [{"text":"🎁 دعوت دوستان","callback_data":"sub|ref"},{"text":"🏠 خانه","callback_data":"home|home"}]]}
+    await send_text(chat_id,text,kb)
+
+async def send_plans_page(chat_id:int,user_id:int):
+    lines=["💎 <b>پلن‌ها</b>",""]
+    for p in plan_list(True):
+        perm=plan_permissions_by_id(str(p["plan_id"])); daily=perm["daily_limit"] or "∞"; yt="Best" if not perm["youtube_max_height"] else f"{perm['youtube_max_height']}p"
+        lines.append(f"{p['icon']} <b>{html.escape(p['name'])}</b> · روزانه <b>{daily}</b> · YouTube <b>{yt}</b> · Batch <b>{perm['batch_limit']}</b>")
+    lines.append("\nبرای فعال‌سازی، Redeem Code وارد کن.")
+    await send_text(chat_id,"\n".join(lines),{"inline_keyboard":[[{"text":"🎟 وارد کردن کد","callback_data":"sub|redeem"},{"text":"⬅️ اشتراک من","callback_data":"sub|me"}]]})
+
+async def send_referral_page(chat_id:int,user_id:int):
+    username=await ensure_bot_username(); count=referral_count(user_id); every=max(1,int(get_setting("referral_reward_every","3") or 3)); days=max(1,int(get_setting("referral_reward_days","1") or 1))
+    link=f"https://t.me/{username}?start=ref_{user_id}"
+    text=(f"🎁 <b>دعوت دوستان</b>\n\n👥 دعوت موفق: <b>{count}</b>\n🎯 هر <b>{every}</b> دعوت → <b>{days} روز VIP</b>\n\nلینک اختصاصی:\n<code>{html.escape(link)}</code>")
+    await send_text(chat_id,text,{"inline_keyboard":[[{"text":"💎 اشتراک من","callback_data":"sub|me"},{"text":"🏠 خانه","callback_data":"home|home"}]]})
+
+async def send_admin_plans(chat_id:int):
+    kb=[]; lines=["💎 <b>Plans & Permissions</b>",""]
+    for p in plan_list(False):
+        pm=plan_permissions_by_id(str(p["plan_id"])); lines.append(f"{p['icon']} {p['name']} · daily {pm['daily_limit'] or '∞'} · batch {pm['batch_limit']} · priority {pm['queue_priority']}")
+        kb.append([{"text":f"{p['icon']} {p['name']}","callback_data":f"plandet|{p['plan_id']}"}])
+    kb.append([{"text":"⬅️ پنل","callback_data":"adm|stats"}]); await send_text(chat_id,"\n".join(lines),{"inline_keyboard":kb})
+
+async def send_admin_plan_detail(chat_id:int,plan_id:str):
+    p=plan_row(plan_id); pm=plan_permissions_by_id(plan_id)
+    if not p: return await send_text(chat_id,"❌ پلن پیدا نشد.")
+    text=(f"{p['icon']} <b>{p['name']}</b> (<code>{plan_id}</code>)\n\n📥 Daily: <b>{pm['daily_limit'] or '∞'}</b>\n📥 Active: <b>{pm['max_active_jobs']}</b>\n⏱ Cooldown: <b>{pm['cooldown']}s</b>\n"
+          f"📚 Batch: <b>{pm['batch_limit']}</b>\n⚡ Queue priority: <b>{pm['queue_priority']}</b>\n▶️ YouTube max: <b>{pm['youtube_max_height'] or 'Best'}</b>\n"
+          f"▶️ YouTube/day: <b>{pm['youtube_daily_limit'] or '∞'}</b>\n🟢 Spotify/day: <b>{pm['spotify_daily_limit'] or '∞'}</b>")
+    fields=[("daily_limit","Daily"),("max_active_jobs","Active"),("cooldown","Cooldown"),("batch_limit","Batch"),("queue_priority","Priority"),("youtube_max_height","YT Max"),("youtube_daily_limit","YT/day"),("spotify_daily_limit","SP/day")]
+    kb=[]
+    for i in range(0,len(fields),2):
+        kb.append([{"text":fields[i][1],"callback_data":f"planedit|{plan_id}|{fields[i][0]}"},{"text":fields[i+1][1],"callback_data":f"planedit|{plan_id}|{fields[i+1][0]}"}])
+    kb.append([{"text":"⬅️ پلن‌ها","callback_data":"adm|plans"}]); await send_text(chat_id,text,{"inline_keyboard":kb})
+
+async def send_admin_codes(chat_id:int):
+    with db() as conn: rows=conn.execute("SELECT * FROM redeem_codes ORDER BY created_at DESC LIMIT 10").fetchall()
+    lines=["🎟 <b>Redeem Codes</b>",""]; kb=[]
+    for r in rows:
+        lines.append(f"<code>{r['code']}</code> · {r['plan_id']} · {r['used_count']}/{r['max_uses'] or '∞'} · {'✅' if int(r['enabled']) else '⛔️'}")
+        kb.append([{"text":f"{'⏸' if int(r['enabled']) else '▶️'} {r['code']}","callback_data":f"codetog|{r['code']}"}])
+    if not rows: lines.append("هنوز کدی ساخته نشده.")
+    kb.append([{"text":"➕ ساخت کد","callback_data":"code|create"},{"text":"⬅️ پنل","callback_data":"adm|stats"}]); await send_text(chat_id,"\n".join(lines),{"inline_keyboard":kb})
+
+async def send_admin_referrals(chat_id:int):
+    every=max(1,int(get_setting("referral_reward_every","3") or 3)); days=max(1,int(get_setting("referral_reward_days","1") or 1)); pid=get_setting("referral_reward_plan","vip") or "vip"
+    with db() as conn:
+        total=int(conn.execute("SELECT COUNT(*) c FROM referrals").fetchone()["c"] or 0)
+        top=conn.execute("SELECT referrer_user_id,COUNT(*) c FROM referrals GROUP BY referrer_user_id ORDER BY c DESC LIMIT 5").fetchall()
+    lines=["🎁 <b>Referral Center</b>","",f"دعوت کل: <b>{total}</b>",f"پاداش: هر <b>{every}</b> دعوت → <b>{days} روز {html.escape(pid.upper())}</b>","","🏆 Top referrers:"]
+    for r in top: lines.append(f"• <code>{r['referrer_user_id']}</code> · <b>{r['c']}</b>")
+    if not top: lines.append("—")
+    kb={"inline_keyboard":[[{"text":"⚙️ تنظیم پاداش","callback_data":"ref|settings"},{"text":"📈 Analytics","callback_data":"adm|analytics"}],[{"text":"⬅️ پنل","callback_data":"adm|stats"}]]}
+    await send_text(chat_id,"\n".join(lines),kb)
+
+async def send_admin_campaigns(chat_id:int):
+    with db() as conn: rows=conn.execute("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 10").fetchall()
+    lines=["📢 <b>Campaigns</b>",""]; kb=[]
+    for r in rows:
+        state="🟢" if int(r["active"]) and int(r["ends_at"])>now_ts() else "⚪️"; lines.append(f"{state} {html.escape(r['name'])} · +{r['daily_bonus']} daily · {format_remaining(int(r['ends_at']))}")
+        if int(r["active"]): kb.append([{"text":f"⏹ {r['name'][:24]}","callback_data":f"campoff|{r['campaign_id']}"}])
+    kb.append([{"text":"➕ کمپین جدید","callback_data":"camp|create"},{"text":"⬅️ پنل","callback_data":"adm|stats"}]); await send_text(chat_id,"\n".join(lines),{"inline_keyboard":kb})
+
+async def send_admin_growth_analytics(chat_id:int):
+    now=now_ts()
+    with db() as conn:
+        users=int(conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"] or 0)
+        active_sub=int(conn.execute("SELECT COUNT(*) c FROM user_subscriptions WHERE expires_at=0 OR expires_at>?",(now,)).fetchone()["c"] or 0)
+        codes=int(conn.execute("SELECT COUNT(*) c FROM redeem_codes").fetchone()["c"] or 0)
+        refs=int(conn.execute("SELECT COUNT(*) c FROM referrals").fetchone()["c"] or 0)
+        rows=conn.execute("SELECT plan_id,COUNT(*) c FROM user_subscriptions WHERE expires_at=0 OR expires_at>? GROUP BY plan_id",(now,)).fetchall()
+    counts={r["plan_id"]:int(r["c"]) for r in rows}; free=max(0,users-sum(counts.values())); cs=cache_stats(); qc=queue_counts()
+    text=(f"📈 <b>Growth Analytics</b>\n\n👥 Users: <b>{users}</b>\n🆓 Free: <b>{free}</b> · ⭐ VIP: <b>{counts.get('vip',0)}</b> · 💎 Premium: <b>{counts.get('premium',0)}</b>\n"
+          f"💳 Active subscriptions: <b>{active_sub}</b>\n🎟 Codes: <b>{codes}</b> · 🎁 Referrals: <b>{refs}</b>\n♻️ Cache reuse: <b>{cs['hits']}</b> · 📥 Queue: <b>{qc['running']} running / {qc['waiting']} waiting</b>")
+    await send_text(chat_id,text,{"inline_keyboard":[[{"text":"⬅️ پنل","callback_data":"adm|stats"}]]})
+
+async def send_admin_audit(chat_id:int):
+    with db() as conn: rows=conn.execute("SELECT * FROM admin_audit_log ORDER BY created_at DESC LIMIT 15").fetchall()
+    lines=["🧾 <b>Admin Audit</b>",""]
+    for r in rows: lines.append(f"• <code>{r['admin_id']}</code> · <b>{html.escape(r['action'])}</b> · {html.escape(r['target'] or '-')}")
+    if not rows: lines.append("هنوز رویدادی ثبت نشده.")
+    await send_text(chat_id,"\n".join(lines),{"inline_keyboard":[[{"text":"⬅️ پنل","callback_data":"adm|stats"}]]})
+
+async def subscription_manager() -> None:
+    while True:
+        try:
+            now=now_ts()
+            with db() as conn: rows=conn.execute("SELECT * FROM user_subscriptions WHERE expires_at>0 ORDER BY expires_at").fetchall()
+            for r in rows:
+                uid=int(r["user_id"]); exp=int(r["expires_at"]); remaining=exp-now
+                if remaining<=0:
+                    with db() as conn:
+                        seen=conn.execute("SELECT 1 FROM subscription_notices WHERE user_id=? AND expires_at=? AND notice_type='expired'",(uid,exp)).fetchone()
+                        if not seen:
+                            conn.execute("INSERT INTO subscription_notices(user_id,expires_at,notice_type,sent_at) VALUES(?,?,?,?)",(uid,exp,"expired",now))
+                            conn.execute("DELETE FROM user_subscriptions WHERE user_id=?",(uid,))
+                            conn.execute("INSERT INTO subscription_events(event_id,user_id,event,payload,created_at) VALUES(?,?,?,?,?)",(secrets.token_hex(8),uid,"expired",str(r["plan_id"]),now))
+                            try: await send_text(uid,"⏳ اشتراکت به پایان رسید و حسابت به پلن Free برگشت.")
+                            except Exception: pass
+                    continue
+                notice=None
+                if remaining<=86400: notice="1d"
+                elif remaining<=3*86400: notice="3d"
+                if notice:
+                    with db() as conn: seen=conn.execute("SELECT 1 FROM subscription_notices WHERE user_id=? AND expires_at=? AND notice_type=?",(uid,exp,notice)).fetchone()
+                    if not seen:
+                        with db() as conn: conn.execute("INSERT INTO subscription_notices(user_id,expires_at,notice_type,sent_at) VALUES(?,?,?,?)",(uid,exp,notice,now))
+                        try: await send_text(uid,f"⏳ از اشتراک <b>{html.escape(str(r['plan_id']).upper())}</b> شما {format_remaining(exp)} باقی مونده.")
+                        except Exception: pass
+            with db() as conn: conn.execute("UPDATE campaigns SET active=0 WHERE active=1 AND ends_at<=?",(now,))
+        except asyncio.CancelledError: raise
+        except Exception as exc: log.warning("subscription manager: %s",exc)
+        await asyncio.sleep(3600)
+# ======================= /V5 Membership & Growth =========================
+
 def user_home_keyboard(user_id:int) -> dict:
     en=user_lang(user_id)=="en"
     rows=[
@@ -1588,6 +1921,7 @@ def user_home_keyboard(user_id:int) -> dict:
         [{"text":"🕘 Recent" if en else "🕘 دانلودهای اخیر","callback_data":"home|recent"},{"text":"⭐ Favorites" if en else "⭐ ذخیره‌شده‌ها","callback_data":"home|favorites"}],
         [{"text":"🔎 History Search" if en else "🔎 جستجوی سابقه","callback_data":"home|history"},{"text":"📊 My Profile" if en else "📊 پروفایل من","callback_data":"home|account"}],
         [{"text":"⚙️ Settings" if en else "⚙️ تنظیمات دانلود","callback_data":"home|settings"},{"text":"📥 My Queue" if en else "📥 صف من","callback_data":"home|queue"}],
+        [{"text":"💎 My Plan" if en else "💎 اشتراک من","callback_data":"sub|me"},{"text":"🎁 Invite" if en else "🎁 دعوت دوستان","callback_data":"sub|ref"}],
         [{"text":"📚 Batch Links" if en else "📚 دانلود گروهی","callback_data":"home|batch"},{"text":"🟢 Services" if en else "🟢 وضعیت سرویس‌ها","callback_data":"home|services"}],
         [{"text":"❓ Help" if en else "❓ راهنما","callback_data":"home|help"}],
     ]
@@ -1599,19 +1933,19 @@ def user_home_keyboard(user_id:int) -> dict:
 
 
 async def send_user_home(chat_id:int,user_id:int,first_name:str=""):
-    st=user_download_stats(user_id); lim=effective_daily_limit(user_id); remaining="∞" if not lim else max(0,lim-st["today"]); prefs=get_user_prefs(user_id)
+    st=user_download_stats(user_id); lim=effective_daily_limit(user_id); remaining="∞" if not lim else max(0,lim-st["today"]); prefs=get_user_prefs(user_id); sub=current_subscription(user_id)
     service_line=" · ".join(f"{PLATFORM_ICONS[p]}{'🟢' if service_enabled(p) else '🔴'}" for p in ("instagram","youtube","twitter","soundcloud","spotify"))
     if user_lang(user_id)=="en":
         intro="\n\n<b>Three steps:</b> send a link → choose format → get the file." if st["total"]==0 else ""
         quick="ON" if prefs["quick_mode"] else "OFF"
         text=(f"👋 {html.escape(first_name) if first_name else 'Hi'}\n<b>{html.escape(BRAND_NAME)}</b>\n\n{service_line}\n\n"
-              f"📥 Today: <b>{st['today']}</b> · 🎟 Remaining: <b>{remaining}</b> · ⚡ Quick: <b>{quick}</b>{intro}\n\n"
+              f"{sub['icon']} Plan: <b>{html.escape(sub['name'])}</b> · 📥 Today: <b>{st['today']}</b> · 🎟 Remaining: <b>{remaining}</b> · ⚡ Quick: <b>{quick}</b>{intro}\n\n"
               "Send a link directly or choose an option 👇")
     else:
         intro="\n\n<b>سه قدم:</b> لینک رو بفرست ← فرمت/کیفیت رو انتخاب کن ← فایل رو بگیر." if st["total"]==0 else ""
         quick="روشن" if prefs["quick_mode"] else "خاموش"
         text=(f"👋 {html.escape(first_name) if first_name else 'سلام'}\n<b>{html.escape(BRAND_NAME)}</b>\n\n{service_line}\n\n"
-              f"📥 امروز: <b>{st['today']}</b> · 🎟 باقی‌مانده: <b>{remaining}</b> · ⚡ سریع: <b>{quick}</b>{intro}\n\n"
+              f"{sub['icon']} پلن: <b>{html.escape(sub['name'])}</b> · 📥 امروز: <b>{st['today']}</b> · 🎟 باقی‌مانده: <b>{remaining}</b> · ⚡ سریع: <b>{quick}</b>{intro}\n\n"
               "لینک رو مستقیم بفرست یا یکی از گزینه‌ها رو انتخاب کن 👇")
     await send_text(chat_id,text,user_home_keyboard(user_id))
 
@@ -1688,20 +2022,25 @@ def quick_action_for_result(user_id:int,result:dict[str,Any]) -> tuple[str,dict[
         if mode=="ask": return None
         if mode=="audio": return ("one",{"idx":0,"quality":"128","mode":"audio"})
         qs=[int(x) for x in (media[0].get("qualities") or []) if str(x).isdigit()]
+        max_h=int(get_plan_permissions(user_id).get('youtube_max_height',0) or 0)
+        if max_h: qs=[qv for qv in qs if qv<=max_h] or qs
         if mode=="720":
-            candidates=[q for q in qs if q<=720]; q=str(max(candidates) if candidates else (min(qs) if qs else "b"))
+            candidates=[qv for qv in qs if qv<=720]; q=str(max(candidates) if candidates else (min(qs) if qs else "b"))
         else: q=str(max(qs) if qs else "b")
         return ("one",{"idx":0,"quality":q,"mode":"video"})
     return None
 
 def admin_keyboard() -> dict:
     return {"inline_keyboard":[
-        [{"text":"📊 داشبورد","callback_data":"adm|stats"},{"text":"⚡ FastSaver APIs","callback_data":"adm|apis"}],
+        [{"text":"📊 داشبورد","callback_data":"adm|stats"},{"text":"💎 پلن‌ها","callback_data":"adm|plans"}],
+        [{"text":"🎟 کدها","callback_data":"adm|codes"},{"text":"🎁 Referral","callback_data":"adm|referral"}],
+        [{"text":"📢 کمپین‌ها","callback_data":"adm|campaigns"},{"text":"⚡ FastSaver APIs","callback_data":"adm|apis"}],
         [{"text":"👥 کاربران","callback_data":"adm|users"},{"text":"🚫 Ban/Unban","callback_data":"adm|userfind"}],
         [{"text":"📢 Broadcast","callback_data":"adm|broadcast"},{"text":"🔌 سرویس‌ها","callback_data":"adm|services"}],
-        [{"text":"🚦 محدودیت","callback_data":"adm|limit"},{"text":"📢 Force Join","callback_data":"adm|forcejoin"}],
+        [{"text":"🆓 سقف Free","callback_data":"adm|limit"},{"text":"📢 Force Join","callback_data":"adm|forcejoin"}],
         [{"text":"🛠 Maintenance","callback_data":"adm|maintenance"},{"text":"❌ خطاها","callback_data":"adm|errors"}],
-        [{"text":"📥 صف دانلود","callback_data":"adm|queue"},{"text":"🩺 سیستم","callback_data":"adm|system"}],
+        [{"text":"📥 صف دانلود","callback_data":"adm|queue"},{"text":"📈 Analytics","callback_data":"adm|analytics"}],
+        [{"text":"🩺 سیستم","callback_data":"adm|system"},{"text":"🧾 Audit Log","callback_data":"adm|audit"}],
         [{"text":"🧹 پاکسازی Jobها","callback_data":"adm|clean"},{"text":"♻️ پاکسازی Cache","callback_data":"adm|cacheclear"}],
         [{"text":"👤 سوییچ به حالت کاربر","callback_data":"mode|user"}]
     ]}
@@ -1771,9 +2110,12 @@ async def send_admin_panel(chat_id:int):
         banned=conn.execute("SELECT COUNT(*) c FROM bans").fetchone()["c"]
         errors24=conn.execute("SELECT COUNT(*) c FROM error_logs WHERE created_at>=?",(now_ts()-86400,)).fetchone()["c"]
     qc=queue_counts(); cs=cache_stats()
-    lines=["🛡 <b>BlueGate Admin</b>","",f"👥 کاربران: <b>{s['users']}</b> · 🚫 بن: <b>{banned}</b>",f"🟢 فعال ۲۴h: <b>{s['active24']}</b>",
+    with db() as conn:
+        subrows=conn.execute("SELECT plan_id,COUNT(*) c FROM user_subscriptions WHERE expires_at=0 OR expires_at>? GROUP BY plan_id",(now_ts(),)).fetchall()
+    pcounts={r['plan_id']:int(r['c']) for r in subrows}
+    lines=["🛡 <b>BlueGate Control Center</b>","",f"👥 کاربران: <b>{s['users']}</b> · 🚫 بن: <b>{banned}</b>",f"🟢 فعال ۲۴h: <b>{s['active24']}</b>",
            f"📥 دانلود کل: <b>{s['downloads']}</b> · امروز: <b>{s['downloads24']}</b>",f"❌ خطای ۲۴h: <b>{errors24}</b>",f"💾 حجم: <b>{gb:.2f} GB</b>",
-           f"🚦 سقف روزانه: <b>{daily_limit() or 'نامحدود'}</b>",f"🛠 Maintenance: <b>{'ON' if bool_setting('maintenance',False) else 'OFF'}</b>",
+           f"🆓 سقف Free: <b>{plan_permissions_by_id('free').get('daily_limit',20) or 'نامحدود'}</b>",f"🛠 Maintenance: <b>{'ON' if bool_setting('maintenance',False) else 'OFF'}</b>",
            f"⚡ API Pool: <b>{pool['total']}</b> · Active <b>{pool['active']}</b> · Limited <b>{pool['rate_limited']}</b>",
            f"📥 Queue: <b>{qc['running']} running</b> · <b>{qc['waiting']} waiting</b>",f"♻️ Smart Cache: <b>{cs['entries']}</b> entries · <b>{cs['hits']}</b> reuse hits",
            f"🗃 DB: <b>{db_backend()}</b>","","📊 <b>پلتفرم‌ها</b>"]
@@ -1793,17 +2135,19 @@ async def admin_users(chat_id:int):
 async def send_admin_user_detail(chat_id:int,uid:int):
     with db() as conn: row=conn.execute("SELECT * FROM users WHERE user_id=?",(uid,)).fetchone()
     if not row: return await send_text(chat_id,"❌ کاربر پیدا نشد.")
-    st=user_download_stats(uid); ov=get_user_override(uid); prefs=get_user_prefs(uid); banned=is_banned(uid); lim=effective_daily_limit(uid)
+    st=user_download_stats(uid); ov=get_user_override(uid); prefs=get_user_prefs(uid); banned=is_banned(uid); lim=effective_daily_limit(uid); sub=current_subscription(uid)
     text=(f"👤 <b>{html.escape(row['first_name'] or '')}</b> @{html.escape(row['username'] or '-')}\nID: <code>{uid}</code>\n\n"
-          f"وضعیت: <b>{'BANNED' if banned else 'ACTIVE'}</b>\n📥 امروز: <b>{st['today']}</b> / <b>{lim or '∞'}</b> · کل: <b>{st['total']}</b>\n"
+          f"وضعیت: <b>{'BANNED' if banned else 'ACTIVE'}</b> · {sub['icon']} <b>{html.escape(sub['name'])}</b> · ⏳ <b>{format_remaining(sub['expires_at'])}</b>\n📥 امروز: <b>{st['today']}</b> / <b>{lim or '∞'}</b> · کل: <b>{st['total']}</b>\n"
           f"⭐ Favorites: <b>{favorite_count(uid)}</b> · Queue: <b>{active_user_queue_count(uid)}</b>\n"
           f"⚡ Quick: <b>{'ON' if prefs['quick_mode'] else 'OFF'}</b> · 🌐 {html.escape(str(prefs['language']))}\n\n"
           f"Overrides → Daily: <b>{ov['daily_limit']}</b> · Active: <b>{ov['max_active_jobs']}</b> · Cooldown: <b>{ov['cooldown']}</b>\n"
           "<i>-1 یعنی استفاده از تنظیم عمومی.</i>")
     kb={"inline_keyboard":[
         [{"text":"✅ Unban" if banned else "🚫 Ban","callback_data":f"adminban|{uid}|{0 if banned else 1}"},{"text":"📨 پیام","callback_data":f"usermsg|{uid}"}],
-        [{"text":"🎟 Daily Limit","callback_data":f"userov|{uid}|daily_limit"},{"text":"📥 Active Jobs","callback_data":f"userov|{uid}|max_active_jobs"}],
-        [{"text":"⏱ Cooldown","callback_data":f"userov|{uid}|cooldown"},{"text":"♻️ Reset Overrides","callback_data":f"userreset|{uid}"}],
+        [{"text":"⭐ VIP","callback_data":f"subgrant|{uid}|vip"},{"text":"💎 Premium","callback_data":f"subgrant|{uid}|premium"}],
+        [{"text":"🆓 Free","callback_data":f"subfree|{uid}"},{"text":"🎟 Daily Limit","callback_data":f"userov|{uid}|daily_limit"}],
+        [{"text":"📥 Active Jobs","callback_data":f"userov|{uid}|max_active_jobs"},{"text":"⏱ Cooldown","callback_data":f"userov|{uid}|cooldown"}],
+        [{"text":"♻️ Reset Overrides","callback_data":f"userreset|{uid}"}],
         [{"text":"⬅️ کاربران","callback_data":"adm|users"}]
     ]}
     await send_text(chat_id,text,kb)
@@ -1867,9 +2211,47 @@ async def handle_admin_input(user_id:int,chat_id:int,text:str,state:tuple[str,st
         try: await send_text(int(payload),text); await send_text(chat_id,"✅ پیام ارسال شد.")
         except Exception as exc: await send_text(chat_id,"❌ ارسال نشد: <code>"+html.escape(str(exc))[:300]+"</code>")
         return True
+    if action=="redeem_create":
+        try:
+            parts=[x.strip() for x in text.split('|')]; plan_id=parts[0].lower(); days=int(parts[1]); uses=int(parts[2]); expdays=int(parts[3]) if len(parts)>3 else 30
+            code=create_redeem_code(plan_id,days,uses,expdays,user_id); await send_text(chat_id,f"✅ کد ساخته شد:\n<code>{code}</code>")
+        except Exception: await send_text(chat_id,"❌ فرمت: <code>vip | 7 | 1 | 30</code>")
+        return True
+    if action=="plan_edit":
+        try:
+            plan_id,field=payload.split('|',1); allowed={'daily_limit','max_active_jobs','cooldown','batch_limit','queue_priority','youtube_max_height','youtube_daily_limit','spotify_daily_limit'}
+            if field not in allowed: raise ValueError()
+            n=int(text.strip())
+            if n<0: raise ValueError()
+            with db() as conn: conn.execute(f"UPDATE plan_permissions SET {field}=?,updated_at=? WHERE plan_id=?",(n,now_ts(),plan_id))
+            audit_admin(user_id,'plan.edit',plan_id,{field:n}); await send_text(chat_id,"✅ پلن آپدیت شد."); await send_admin_plan_detail(chat_id,plan_id)
+        except Exception: await send_text(chat_id,"❌ یک عدد صفر یا بیشتر بفرست.")
+        return True
+    if action=="grant_sub":
+        try:
+            uid_s,pid=payload.split('|',1); days=int(text.strip()); exp=grant_subscription(int(uid_s),pid,days,f"admin:{user_id}"); audit_admin(user_id,'subscription.grant',uid_s,{'plan':pid,'days':days}); await send_text(chat_id,f"✅ {pid} برای {days} روز فعال شد."); await send_admin_user_detail(chat_id,int(uid_s))
+        except Exception: await send_text(chat_id,"❌ تعداد روز رو به صورت عدد بفرست.")
+        return True
+    if action=="referral_settings":
+        try:
+            parts=[x.strip() for x in text.split('|')]; every=max(1,int(parts[0])); pid=parts[1].lower(); days=max(1,int(parts[2]));
+            if not plan_row(pid): raise ValueError()
+            set_setting('referral_reward_every',str(every)); set_setting('referral_reward_plan',pid); set_setting('referral_reward_days',str(days)); audit_admin(user_id,'referral.settings','',{'every':every,'plan':pid,'days':days}); await send_text(chat_id,'✅ تنظیمات Referral ذخیره شد.'); await send_admin_referrals(chat_id)
+        except Exception: await send_text(chat_id,'❌ فرمت: <code>3 | vip | 1</code>')
+        return True
+    if action=="campaign_create":
+        try:
+            parts=[x.strip() for x in text.split('|')]; name=parts[0]; hours=max(1,int(parts[1])); bonus=max(0,int(parts[2])); cid=secrets.token_hex(5); now=now_ts()
+            with db() as conn: conn.execute("INSERT INTO campaigns(campaign_id,name,starts_at,ends_at,daily_bonus,active,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",(cid,name,now,now+hours*3600,bonus,1,user_id,now))
+            audit_admin(user_id,'campaign.create',cid,{'name':name,'hours':hours,'bonus':bonus}); await send_text(chat_id,"✅ کمپین ساخته شد."); await send_admin_campaigns(chat_id)
+        except Exception: await send_text(chat_id,"❌ فرمت: <code>Weekend Boost | 48 | 20</code>")
+        return True
     if action=="limit":
-        try: n=max(0,int(text.strip())); set_setting('daily_limit',str(n)); await send_text(chat_id,f"✅ سقف روزانه شد <b>{n or 'نامحدود'}</b>.")
-        except: await send_text(chat_id,"❌ فقط عدد بفرست؛ 0 یعنی نامحدود.")
+        try:
+            n=max(0,int(text.strip())); set_setting('daily_limit',str(n))
+            with db() as conn: conn.execute("UPDATE plan_permissions SET daily_limit=?,updated_at=? WHERE plan_id='free'",(n,now_ts()))
+            audit_admin(user_id,'plan.edit','free',{'daily_limit':n}); await send_text(chat_id,f"✅ سقف روزانه Free شد <b>{n or 'نامحدود'}</b>.")
+        except Exception: await send_text(chat_id,"❌ فقط عدد بفرست؛ 0 یعنی نامحدود.")
         return True
     if action=="forcejoin":
         parts=[x.strip() for x in text.split('|',1)]; channel=parts[0]; url=parts[1] if len(parts)>1 else ''
@@ -1974,14 +2356,14 @@ async def show_result_card(chat_id:int,result:dict[str,Any],job_id:str,status_me
 
 
 async def send_account_page(chat_id:int,user_id:int):
-    st=user_download_stats(user_id); lim=effective_daily_limit(user_id); rem="∞" if not lim else max(0,lim-st["today"]); prefs=get_user_prefs(user_id)
+    st=user_download_stats(user_id); lim=effective_daily_limit(user_id); rem="∞" if not lim else max(0,lim-st["today"]); prefs=get_user_prefs(user_id); sub=current_subscription(user_id)
     top=PLATFORM_LABELS.get(st["top"],st["top"]); favs=favorite_count(user_id); q=active_user_queue_count(user_id)
     if user_lang(user_id)=="en":
-        text=(f"📊 <b>My Profile</b>\n\n📥 Today: <b>{st['today']}</b> / <b>{lim or '∞'}</b>\n🎟 Remaining: <b>{rem}</b>\n"
+        text=(f"📊 <b>My Profile</b>\n\n{sub['icon']} Plan: <b>{html.escape(sub['name'])}</b> · ⏳ <b>{format_remaining(sub['expires_at'])}</b>\n📥 Today: <b>{st['today']}</b> / <b>{lim or '∞'}</b>\n🎟 Remaining: <b>{rem}</b>\n"
               f"📦 Total downloads: <b>{st['total']}</b>\n⭐ Favorites: <b>{favs}</b>\n📥 Active jobs: <b>{q}</b>\n"
               f"🔥 Most used: <b>{html.escape(top)}</b>\n⚡ Quick Mode: <b>{'ON' if prefs['quick_mode'] else 'OFF'}</b>")
     else:
-        text=(f"📊 <b>پروفایل من</b>\n\n📥 امروز: <b>{st['today']}</b> / <b>{lim or '∞'}</b>\n🎟 باقی‌مانده: <b>{rem}</b>\n"
+        text=(f"📊 <b>پروفایل من</b>\n\n{sub['icon']} پلن: <b>{html.escape(sub['name'])}</b> · ⏳ <b>{format_remaining(sub['expires_at'])}</b>\n📥 امروز: <b>{st['today']}</b> / <b>{lim or '∞'}</b>\n🎟 باقی‌مانده: <b>{rem}</b>\n"
               f"📦 کل دانلودها: <b>{st['total']}</b>\n⭐ ذخیره‌شده‌ها: <b>{favs}</b>\n📥 Job فعال: <b>{q}</b>\n"
               f"🔥 سرویس پرکاربرد: <b>{html.escape(top)}</b>\n⚡ Quick Mode: <b>{'روشن' if prefs['quick_mode'] else 'خاموش'}</b>")
     kb={"inline_keyboard":[[{"text":"⚙️ Settings" if user_lang(user_id)=="en" else "⚙️ تنظیمات","callback_data":"home|settings"},{"text":"⭐ Favorites" if user_lang(user_id)=="en" else "⭐ ذخیره‌شده‌ها","callback_data":"home|favorites"}],[{"text":"🏠 Home" if user_lang(user_id)=="en" else "🏠 خانه","callback_data":"home|home"}]]}
@@ -2062,9 +2444,9 @@ async def process_url_message(message:dict[str,Any],url:str):
     chat_id=message["chat"]["id"]; user=message.get("from",{}); user_id=user.get("id",chat_id)
     platform=detect_platform(url)
     if not service_enabled(platform): return await send_text(chat_id,f"🔴 {PLATFORM_LABELS.get(platform,platform)} فعلاً غیرفعاله.",nav_home_keyboard())
-    lim=effective_daily_limit(user_id)
-    if user_id not in ADMIN_IDS and lim and user_downloads_today(user_id)>=lim:
-        return await send_text(chat_id,f"🚦 سقف دانلود ۲۴ ساعته‌ات ({lim}) پر شده.",nav_home_keyboard())
+    access_error=plan_access_error(user_id,platform)
+    if access_error:
+        return await send_text(chat_id,access_error,{"inline_keyboard":[[{"text":"💎 اشتراک من","callback_data":"sub|me"},{"text":"🏠 خانه","callback_data":"home|home"}]]})
     if platform=="generic": return await send_text(chat_id,"❌ این لینک فعلاً پشتیبانی نمی‌شه.",nav_home_keyboard())
     status=await send_text(chat_id,f"{PLATFORM_ICONS.get(platform,'🌐')} <b>بررسی لینک</b>\n▰▱▱▱ تشخیص محتوا…")
     try:
@@ -2115,16 +2497,24 @@ async def handle_message(message:dict[str,Any]):
     if urls:
         clear_user_state(user_id)
         if len(urls)>1:
-            selected=urls[:BATCH_MAX_LINKS]
+            batch_limit=effective_batch_limit(user_id) if user_id not in ADMIN_IDS else BATCH_MAX_LINKS
+            selected=urls[:batch_limit]
             await send_text(chat_id,ux(user_id,f"📚 <b>دانلود گروهی</b>\n{len(selected)} لینک دریافت شد. هرکدوم جدا پردازش میشه.",f"📚 <b>Batch Download</b>\n{len(selected)} links received. Each will be processed separately."))
             for url in selected:
                 await process_url_message(message,url)
                 await asyncio.sleep(.15)
-            if len(urls)>BATCH_MAX_LINKS:
-                await send_text(chat_id,ux(user_id,f"⚠️ در هر پیام حداکثر {BATCH_MAX_LINKS} لینک پردازش میشه.",f"⚠️ Up to {BATCH_MAX_LINKS} links are processed per message."),nav_home_keyboard())
+            if len(urls)>batch_limit:
+                await send_text(chat_id,ux(user_id,f"⚠️ پلنت در هر پیام حداکثر {batch_limit} لینک رو پردازش می‌کنه.",f"⚠️ Your plan processes up to {batch_limit} links per message."),nav_home_keyboard())
             return
         return await process_url_message(message,urls[0])
     state=get_user_state(user_id)
+    if state and state[0]=="redeem_code" and text.strip():
+        clear_user_state(user_id); ok,status=redeem_subscription_code(user_id,text.strip())
+        if ok:
+            sub=current_subscription(user_id); await send_text(chat_id,f"✅ اشتراک <b>{html.escape(sub['name'])}</b> فعال شد.")
+            return await send_subscription_page(chat_id,user_id)
+        messages={'invalid':'❌ کد معتبر نیست.','expired':'⌛️ این کد منقضی شده.','used_up':'❌ ظرفیت استفاده از این کد تموم شده.','already_used':'ℹ️ قبلاً از این کد استفاده کردی.'}
+        return await send_text(chat_id,messages.get(status,'❌ کد فعال نشد.'),nav_home_keyboard())
     if state and state[0]=="music_search" and text.strip():
         clear_user_state(user_id)
         return await process_music_search(chat_id,user_id,text.strip())
@@ -2154,10 +2544,22 @@ async def handle_message_legacy(message:dict[str,Any]):
         if not await ensure_joined(user_id,chat_id): return
         await send_user_home(chat_id,user_id,user.get("first_name","")); return
     if text.startswith("/start"):
+        parts=text.split(maxsplit=1)
+        if len(parts)>1 and parts[1].startswith('ref_'):
+            try: register_referral(user_id,int(parts[1][4:]))
+            except Exception: pass
         if user_id in ADMIN_IDS and get_admin_mode(user_id)=="admin":
             await send_admin_panel(chat_id); return
         if not await ensure_joined(user_id,chat_id): return
         await send_user_home(chat_id,user_id,user.get("first_name","")); return
+    if text.startswith("/redeem"):
+        parts=text.split(maxsplit=1)
+        if len(parts)<2:
+            set_user_state(user_id,'redeem_code'); await send_text(chat_id,"🎟 کد فعال‌سازی رو بفرست.",nav_home_keyboard()); return
+        ok,status=redeem_subscription_code(user_id,parts[1]);
+        if ok: await send_text(chat_id,"✅ اشتراک فعال شد."); await send_subscription_page(chat_id,user_id)
+        else: await send_text(chat_id,"❌ کد قابل استفاده نیست.",nav_home_keyboard())
+        return
     if text.startswith("/help"):
         if not await ensure_joined(user_id,chat_id): return
         await send_text(chat_id,HELP_TEXT,user_home_keyboard(user_id)); return
@@ -2224,7 +2626,7 @@ async def handle_callback_legacy(cb:dict[str,Any]):
         elif action=="services": await send_text(chat_id,"🔌 <b>سرویس‌ها</b>\nروی هر سرویس بزن تا روشن/خاموش بشه.",services_keyboard())
         elif action=="broadcast": set_admin_state(user_id,"broadcast"); await send_text(chat_id,"📢 پیام Broadcast رو همین الان بفرست. HTML تلگرام هم قابل استفاده‌ست.")
         elif action=="userfind": set_admin_state(user_id,"userfind"); await send_text(chat_id,"👤 Telegram ID یا username کاربر رو بفرست.")
-        elif action=="limit": set_admin_state(user_id,"limit"); await send_text(chat_id,f"🚦 سقف فعلی: <b>{daily_limit() or 'نامحدود'}</b>\nعدد جدید رو بفرست؛ 0 یعنی نامحدود.")
+        elif action=="limit": set_admin_state(user_id,"limit"); await send_text(chat_id,f"🆓 سقف روزانه Free: <b>{plan_permissions_by_id('free').get('daily_limit',20) or 'نامحدود'}</b>\nعدد جدید رو بفرست؛ 0 یعنی نامحدود.")
         elif action=="forcejoin": set_admin_state(user_id,"forcejoin"); await send_text(chat_id,"📢 به این فرمت بفرست:\n<code>@Channel | https://t.me/Channel</code>\nبرای خاموش کردن: <code>off</code>")
         elif action=="maintenance":
             new=not bool_setting('maintenance',False); set_setting('maintenance','1' if new else '0'); await send_text(chat_id,f"🛠 Maintenance: <b>{'ON' if new else 'OFF'}</b>")
@@ -2272,11 +2674,11 @@ async def handle_callback_legacy(cb:dict[str,Any]):
             return
     if data.startswith("admtoggle|"):
         if user_id not in ADMIN_IDS: await safe_answer_callback(cb_id,"Access denied",True); return
-        p=data.split("|",1)[1]; set_setting(f"service_{p}",'0' if service_enabled(p) else '1'); await safe_answer_callback(cb_id,"تغییر کرد ✅")
+        p=data.split("|",1)[1]; set_setting(f"service_{p}",'0' if service_enabled(p) else '1'); audit_admin(user_id,'service.toggle',p,{'enabled':service_enabled(p)}); await safe_answer_callback(cb_id,"تغییر کرد ✅")
         await edit_text(chat_id,message['message_id'],"🔌 <b>سرویس‌ها</b>\nروی هر سرویس بزن تا روشن/خاموش بشه.",services_keyboard()); return
     if data.startswith("adminban|"):
         if user_id not in ADMIN_IDS: await safe_answer_callback(cb_id,"Access denied",True); return
-        _,uid,b=data.split('|'); set_ban(int(uid),b=='1'); await safe_answer_callback(cb_id,"انجام شد ✅"); await send_text(chat_id,f"{'🚫 Ban' if b=='1' else '✅ Unban'}: <code>{uid}</code>"); return
+        _,uid,b=data.split('|'); set_ban(int(uid),b=='1'); audit_admin(user_id,'user.ban' if b=='1' else 'user.unban',uid); await safe_answer_callback(cb_id,"انجام شد ✅"); await send_text(chat_id,f"{'🚫 Ban' if b=='1' else '✅ Unban'}: <code>{uid}</code>"); return
     if user_id not in ADMIN_IDS and is_banned(user_id): await safe_answer_callback(cb_id,"دسترسی مسدود است.",True); return
     if user_id not in ADMIN_IDS and bool_setting("maintenance",False): await safe_answer_callback(cb_id,"بات در حال بروزرسانی است.",True); return
     if not await is_joined(user_id):
@@ -2370,7 +2772,8 @@ def queue_resource_key(kind:str, job:dict[str,Any], payload:dict[str,Any]) -> st
 
 
 def queue_priority(user_id:int) -> int:
-    return 0 if user_id in ADMIN_IDS else 100
+    if user_id in ADMIN_IDS: return 0
+    return max(1,int(get_plan_permissions(user_id).get('queue_priority',100)))
 
 
 def queue_get(queue_id:str):
@@ -2684,7 +3087,59 @@ async def handle_callback(cb:dict[str,Any]):
     cb_id=cb["id"]; message=cb.get("message") or {}; chat_id=message.get("chat",{}).get("id")
     user=cb.get("from",{}); user_id=user.get("id"); data=cb.get("data",""); upsert_user(user)
     if not chat_id: return await handle_callback_legacy(cb)
-    user_ux = data.startswith(("home|","pref|","recent|","favadd|","favlast|","favsend|","favdel|","again|","retry|","retryms|","report|","ms|","sp|","all|","a|","d|","qstatus|","qcancel|"))
+    # V5 user membership actions
+    if data.startswith('sub|'):
+        if user_id not in ADMIN_IDS and (is_banned(user_id) or bool_setting('maintenance',False)): return await safe_answer_callback(cb_id,'Unavailable',True)
+        if not await is_joined(user_id): await safe_answer_callback(cb_id,'اول عضو کانال شو.',True); return
+        action=data.split('|',1)[1]; await safe_answer_callback(cb_id)
+        if action=='me': return await send_subscription_page(chat_id,user_id)
+        if action=='plans': return await send_plans_page(chat_id,user_id)
+        if action=='ref': return await send_referral_page(chat_id,user_id)
+        if action=='redeem': set_user_state(user_id,'redeem_code'); return await send_text(chat_id,'🎟 کد فعال‌سازی رو بفرست.',nav_home_keyboard())
+    # V5 admin control center
+    if data in {'adm|plans','adm|codes','adm|campaigns','adm|analytics','adm|audit','adm|referral'}:
+        if user_id not in ADMIN_IDS: return await safe_answer_callback(cb_id,'Access denied',True)
+        await safe_answer_callback(cb_id); action=data.split('|',1)[1]
+        if action=='plans': return await send_admin_plans(chat_id)
+        if action=='codes': return await send_admin_codes(chat_id)
+        if action=='campaigns': return await send_admin_campaigns(chat_id)
+        if action=='analytics': return await send_admin_growth_analytics(chat_id)
+        if action=='audit': return await send_admin_audit(chat_id)
+        if action=='referral': return await send_admin_referrals(chat_id)
+    if data=='ref|settings':
+        if user_id not in ADMIN_IDS: return
+        await safe_answer_callback(cb_id); set_admin_state(user_id,'referral_settings'); return await send_text(chat_id,'فرمت پاداش Referral:\n<code>3 | vip | 1</code>\nهر چند دعوت | پلن | چند روز')
+    if data.startswith('codetog|'):
+        if user_id not in ADMIN_IDS: return
+        code=data.split('|',1)[1]
+        with db() as conn:
+            row=conn.execute('SELECT enabled FROM redeem_codes WHERE code=?',(code,)).fetchone()
+            if row: conn.execute('UPDATE redeem_codes SET enabled=? WHERE code=?',(0 if int(row['enabled']) else 1,code))
+        audit_admin(user_id,'code.toggle',code); await safe_answer_callback(cb_id,'تغییر کرد'); return await send_admin_codes(chat_id)
+    if data.startswith('plandet|'):
+        if user_id not in ADMIN_IDS: return
+        await safe_answer_callback(cb_id); return await send_admin_plan_detail(chat_id,data.split('|',1)[1])
+    if data.startswith('planedit|'):
+        if user_id not in ADMIN_IDS: return
+        _,pid,field=data.split('|',2); await safe_answer_callback(cb_id); set_admin_state(user_id,'plan_edit',f'{pid}|{field}'); return await send_text(chat_id,f'عدد جدید برای <b>{html.escape(field)}</b> رو بفرست. 0 می‌تونه معنی نامحدود/Best داشته باشه.')
+    if data=='code|create':
+        if user_id not in ADMIN_IDS: return
+        await safe_answer_callback(cb_id); set_admin_state(user_id,'redeem_create'); return await send_text(chat_id,"فرمت رو بفرست:\n<code>vip | 7 | 1 | 30</code>\nplan | duration days | max uses | code expiry days")
+    if data.startswith('subgrant|'):
+        if user_id not in ADMIN_IDS: return
+        _,uid,pid=data.split('|',2); await safe_answer_callback(cb_id); set_admin_state(user_id,'grant_sub',f'{uid}|{pid}'); return await send_text(chat_id,f'چند روز {pid} فعال باشه؟ عدد رو بفرست.')
+    if data.startswith('subfree|'):
+        if user_id not in ADMIN_IDS: return
+        uid=int(data.split('|',1)[1]); grant_subscription(uid,'free',0,f'admin:{user_id}'); audit_admin(user_id,'subscription.free',str(uid)); await safe_answer_callback(cb_id,'Free ✅'); return await send_admin_user_detail(chat_id,uid)
+    if data=='camp|create':
+        if user_id not in ADMIN_IDS: return
+        await safe_answer_callback(cb_id); set_admin_state(user_id,'campaign_create'); return await send_text(chat_id,"فرمت کمپین:\n<code>Weekend Boost | 48 | 20</code>\nنام | مدت به ساعت | Bonus روزانه")
+    if data.startswith('campoff|'):
+        if user_id not in ADMIN_IDS: return
+        cid=data.split('|',1)[1];
+        with db() as conn: conn.execute('UPDATE campaigns SET active=0 WHERE campaign_id=?',(cid,))
+        audit_admin(user_id,'campaign.stop',cid); await safe_answer_callback(cb_id,'متوقف شد'); return await send_admin_campaigns(chat_id)
+    user_ux = data.startswith(("home|","sub|","pref|","recent|","favadd|","favlast|","favsend|","favdel|","again|","retry|","retryms|","report|","ms|","sp|","all|","a|","d|","qstatus|","qcancel|"))
     if user_ux and user_id not in ADMIN_IDS and is_banned(user_id):
         await safe_answer_callback(cb_id,"دسترسی مسدود است.",True); return
     if user_ux and user_id not in ADMIN_IDS and bool_setting("maintenance",False):
@@ -2784,7 +3239,13 @@ async def handle_callback(cb:dict[str,Any]):
         elif parts[0]=="a" and len(parts)==4:
             _,jid,idx_s,bitrate=parts; job=load_job(jid); kind="one"; payload={"idx":int(idx_s),"quality":bitrate,"mode":"audio"}
         elif parts[0]=="d" and len(parts)==5:
-            _,jid,media_kind,idx_s,quality=parts; job=load_job(jid); kind="one"; payload={"idx":int(idx_s),"quality":quality,"mode":"video"}
+            _,jid,media_kind,idx_s,quality=parts; job=load_job(jid); kind="one"
+            if job and job['result'].get('platform')=='youtube' and user_id not in ADMIN_IDS:
+                max_h=int(get_plan_permissions(user_id).get('youtube_max_height',0) or 0)
+                if max_h and str(quality).isdigit() and int(quality)>max_h:
+                    return await send_text(chat_id,f"🔒 پلن فعلیت تا <b>{max_h}p</b> اجازه می‌ده.",{"inline_keyboard":[[{"text":"💎 اشتراک من","callback_data":"sub|me"}]]})
+                if max_h and quality=='b': quality=str(max_h)
+            payload={"idx":int(idx_s),"quality":quality,"mode":"video"}
         else: job=None
         if not job or job["user_id"]!=user_id: return await send_text(chat_id,"⌛️ درخواست منقضی شده؛ لینک رو دوباره بفرست.",nav_home_keyboard())
         return await enqueue_download(job,user_id,chat_id,kind,payload)
@@ -2813,6 +3274,7 @@ async def startup():
     for i in range(MAX_CONCURRENT_JOBS):
         task=asyncio.create_task(queue_worker(i+1),name=f"queue-worker-{i+1}"); QUEUE_WORKERS.append(task); BACKGROUND_TASKS.add(task); task.add_done_callback(BACKGROUND_TASKS.discard)
     ht=asyncio.create_task(fastsaver_health_manager(),name="fastsaver-health"); BACKGROUND_TASKS.add(ht); ht.add_done_callback(BACKGROUND_TASKS.discard)
+    st=asyncio.create_task(subscription_manager(),name="subscription-manager"); BACKGROUND_TASKS.add(st); st.add_done_callback(BACKGROUND_TASKS.discard)
     log.info("queue started workers=%s recovered=%s",MAX_CONCURRENT_JOBS,QUEUE_RUNTIME.qsize())
     if BOT_TOKEN and WEBHOOK_URL:
         try:

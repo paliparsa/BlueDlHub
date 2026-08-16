@@ -1,6 +1,6 @@
 # BlueGate Downloader
 
-Telegram downloader service with a web-hook based backend, persistent database support, user/admin modes, download queue, caching, and FastSaver API pooling.
+BlueGate Downloader is a Telegram media downloader with a persistent PostgreSQL backend, user/admin modes, download queue, caching, FastSaver API pooling, and membership controls.
 
 ## Supported sources
 
@@ -10,36 +10,66 @@ Telegram downloader service with a web-hook based backend, persistent database s
 - SoundCloud
 - Spotify
 
-## Main features
+## V5 features
+
+### Membership
+
+The bot includes three default plans:
+
+| Plan | Daily downloads | Active jobs | Cooldown | Batch | Queue priority | YouTube | Spotify/day |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Free | 20 | 2 | 5s | 3 | 100 | 720p | 5 |
+| VIP | 100 | 5 | 1s | 10 | 50 | 1080p | 30 |
+| Premium | Unlimited | 10 | 0s | 25 | 10 | Best | Unlimited |
+
+All values can be edited from the admin panel without redeploying the service.
+
+V5 also includes:
+
+- Redeem codes with plan, duration, use count and expiry
+- Referral links and automatic rewards
+- Subscription expiry reminders and automatic return to Free
+- Per-plan YouTube and Spotify limits
+- Plan-based queue priority
+- Global campaigns that temporarily add daily download allowance
+- Growth analytics
+- Admin audit log
+- Direct subscription management from each user's admin profile
+
+Existing V4 data is kept. New V5 tables are created automatically on startup.
+
+## Existing platform features
 
 - Separate User and Admin modes
-- Smart download queue with retry and cancellation
-- Duplicate-job detection and Telegram `file_id` cache
+- Smart queue with retry and cancellation
+- Duplicate-job detection
+- Telegram `file_id` cache and recent downloads
 - Multiple FastSaver API keys with automatic fallback
+- FastSaver health monitoring
 - Persistent PostgreSQL storage via Neon
-- Per-user preferences and quick-download mode
-- Favorites and recent-download history
+- Quick Download preferences
+- Favorites and history search
 - Batch link processing
-- Daily limits, cooldowns, bans and per-user overrides
-- Maintenance mode, broadcast and service toggles
+- Per-user overrides, bans and cooldowns
+- Broadcast, Force Join and Maintenance mode
 - Persian / English user interface
 
 ## Files
 
 ```text
-main.py            Application entry point
-requirements.txt   Python dependencies
-Dockerfile         Container build configuration
-start.sh           Application start command
-render.yaml        Render deployment configuration
-.env.example       Environment variable template
-.gitignore         Git ignore rules
-README.md          Project documentation
+main.py
+requirements.txt
+Dockerfile
+start.sh
+render.yaml
+.env.example
+.gitignore
+README.md
 ```
 
 ## Required environment variables
 
-Create these in Render under **Environment**:
+Add these in Render under **Environment**:
 
 ```env
 BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
@@ -49,51 +79,52 @@ ADMIN_IDS=YOUR_TELEGRAM_USER_ID
 DATABASE_URL=YOUR_NEON_POSTGRES_CONNECTION_STRING
 ```
 
-`ADMIN_IDS` can contain multiple Telegram user IDs separated by commas if supported by your deployment configuration.
+Multiple admin IDs can be separated with commas.
 
-### FastSaver
+## FastSaver
 
-A bootstrap key can optionally be set with:
+An initial key can optionally be provided through Render:
 
 ```env
 FASTSAVER_API_KEY=fs_sk_xxxxxxxxx
 ```
 
-After the bot is running, additional FastSaver API keys can be added directly from:
+After the bot is running, manage all additional keys from:
 
 ```text
-/start → Admin Mode → FastSaver APIs → Add API
+/start → Admin Mode → FastSaver APIs
 ```
 
-The bot stores API keys in the persistent database and automatically falls back to another active key when a key is rate-limited, exhausted or unavailable.
+The API pool supports automatic fallback when a key is rate-limited, exhausted, disabled or temporarily unavailable.
 
-## Neon database setup
+## Neon setup
 
 1. Create a project in Neon.
-2. Open the project and choose **Connect**.
+2. Open **Connect** in the project dashboard.
 3. Copy the pooled PostgreSQL connection string.
-4. Add it to Render as:
+4. Add it to Render as `DATABASE_URL`.
+
+Example format:
 
 ```env
 DATABASE_URL=postgresql://USER:PASSWORD@HOST/DATABASE?sslmode=require
 ```
 
-Do not commit the connection string to GitHub.
+Do not commit this value to GitHub.
 
-No manual table creation is required. The application creates or migrates its required tables during startup.
+No SQL setup is required. Tables and migrations are handled automatically during application startup.
 
-If `DATABASE_URL` is not defined, the application falls back to the local SQLite path configured by `DB_PATH`. For Render deployments, PostgreSQL is recommended for persistent data.
+If `DATABASE_URL` is missing, SQLite is used as a local fallback. SQLite on a free Render service should not be treated as persistent storage.
 
-## Render deployment
+## Deploy on Render
 
-1. Create a GitHub repository.
-2. Upload all project files to the repository root.
-3. Create a new Render Web Service connected to the repository.
-4. Select Docker deployment if Render does not detect it automatically.
-5. Add the required environment variables.
-6. Deploy the service.
+1. Upload all project files to the root of a GitHub repository.
+2. Create a Render Web Service connected to that repository.
+3. Use the included Docker configuration.
+4. Add the required environment variables.
+5. Deploy.
 
-The repository root should look like:
+The repository root should contain:
 
 ```text
 main.py
@@ -106,15 +137,148 @@ render.yaml
 README.md
 ```
 
-The health endpoint is:
+Health endpoint:
 
 ```text
 /health
 ```
 
-## Optional settings
+## Admin control center
 
-Defaults are already provided, but these can be overridden in Render:
+Administrators listed in `ADMIN_IDS` enter Admin Mode from `/start` and can switch back to User Mode at any time.
+
+Main sections include:
+
+- Dashboard
+- Plans & permissions
+- Redeem codes
+- Referral center
+- Campaigns
+- Users and subscription management
+- FastSaver API pool
+- Services
+- Broadcast
+- Queue
+- Analytics
+- Error center
+- System status
+- Audit log
+
+### Editing plans
+
+Open:
+
+```text
+Admin → Plans → select a plan
+```
+
+Editable values include:
+
+- Daily limit
+- Active jobs
+- Cooldown
+- Batch size
+- Queue priority
+- Maximum YouTube height
+- YouTube daily limit
+- Spotify daily limit
+
+A value of `0` means unlimited where applicable. For maximum YouTube height, `0` means Best/unrestricted.
+
+### Creating a redeem code
+
+Open:
+
+```text
+Admin → Codes → Create Code
+```
+
+Send:
+
+```text
+vip | 7 | 1 | 30
+```
+
+Meaning:
+
+```text
+plan | subscription days | maximum uses | code expiry days
+```
+
+Users can redeem codes from **My Plan → Redeem Code** or with:
+
+```text
+/redeem CODE
+```
+
+### Referral rewards
+
+Open:
+
+```text
+Admin → Referral → Reward Settings
+```
+
+Example:
+
+```text
+3 | vip | 1
+```
+
+This means every 3 successful referrals grants 1 day of VIP.
+
+Each user receives a personal Telegram deep link from **Invite Friends**. Self-referrals and multiple referrers for the same user are blocked.
+
+### Campaigns
+
+A campaign temporarily adds extra daily downloads to non-unlimited plans.
+
+Open:
+
+```text
+Admin → Campaigns → New Campaign
+```
+
+Example:
+
+```text
+Weekend Boost | 48 | 20
+```
+
+This creates a 48-hour campaign with +20 downloads per day.
+
+### Direct subscription management
+
+Open a user from the Admin Users page. You can:
+
+- Grant VIP
+- Grant Premium
+- Return the account to Free
+- Change per-user daily limits
+- Change active-job limits
+- Change cooldown
+- Ban / Unban
+- Send a direct message
+
+## User membership interface
+
+Users can open **My Plan** to see:
+
+- Current plan
+- Remaining subscription time
+- Downloads used today
+- Batch limit
+- Queue priority
+- YouTube quality allowance
+- Spotify daily allowance
+
+They can also open **Invite Friends** to get their referral link.
+
+## Subscription expiry
+
+The bot checks active subscriptions in the background. It can send reminders near expiry and automatically returns expired subscriptions to Free. Subscription events are stored in the database.
+
+## Optional environment settings
 
 ```env
 BRAND_NAME=BlueGate Downloader
@@ -132,46 +296,29 @@ USER_JOB_COOLDOWN=3
 QUEUE_MAX_RETRIES=2
 SMART_CACHE_TTL_DAYS=90
 FASTSAVER_HEALTH_INTERVAL=600
-BATCH_MAX_LINKS=10
+BATCH_MAX_LINKS=25
 ```
 
-For low-memory hosting, reducing concurrent jobs is recommended:
+`BATCH_MAX_LINKS` is the absolute system ceiling. Each membership plan can have a smaller batch limit.
+
+For low-memory hosting, use:
 
 ```env
 MAX_CONCURRENT_JOBS=2
 ```
 
-## Admin access
-
-Administrators listed in `ADMIN_IDS` receive the admin interface when using `/start` and can switch between Admin Mode and User Mode.
-
-Admin tools include:
-
-- Dashboard and usage statistics
-- User management and bans
-- FastSaver API pool management
-- Broadcast messages
-- Service enable/disable controls
-- Daily limits and per-user overrides
-- Force Join configuration
-- Maintenance mode
-- Queue monitoring and cancellation
-- Error reports and system status
-
 ## Updating
 
-To update the bot:
+1. Replace the files in the GitHub repository with the new version.
+2. Keep all secrets in Render Environment variables.
+3. Commit and push.
+4. Let Render redeploy.
 
-1. Replace the project files in the GitHub repository with the new version.
-2. Keep secrets only in Render Environment variables.
-3. Commit and push the changes.
-4. Render will redeploy automatically when Auto Deploy is enabled.
+Neon is independent from the Render container, so normal deployments keep users, API keys, subscriptions, codes, referrals and settings.
 
-Neon data is kept independently from the application deployment, so normal updates do not remove users, settings or API-pool entries.
+## Security
 
-## Security notes
-
-- Never commit `BOT_TOKEN`, FastSaver API keys or `DATABASE_URL`.
-- Revoke and replace a Telegram bot token immediately if it becomes public.
-- Keep `.env` files outside version control.
-- Use a dedicated database and service credentials for production deployments.
+- Never commit Telegram bot tokens, FastSaver keys or `DATABASE_URL`.
+- Revoke a Telegram bot token immediately if it is exposed.
+- Do not commit `.env` files.
+- Use dedicated production credentials for the bot and database.

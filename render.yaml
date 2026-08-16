@@ -50,4 +50,4 @@ services:
       - key: FASTSAVER_HEALTH_INTERVAL
         value: "600"
       - key: BATCH_MAX_LINKS
-        value: "10"
+        value: "25"
