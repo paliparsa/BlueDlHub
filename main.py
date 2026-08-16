@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO)
 # Avoid httpx logging full Telegram Bot API URLs (which contain the bot token).
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-log = logging.getLogger("bluegate-downloader-v4.2")
+log = logging.getLogger("bluegate-downloader-v4.3")
 STARTED_AT = int(time.time())
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -82,7 +82,7 @@ if not BOT_TOKEN:
     log.warning("BOT_TOKEN is not set")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-app = FastAPI(title="BlueGate Multi Downloader V4.2 Hybrid Admin/API Pool")
+app = FastAPI(title="BlueGate Multi Downloader V4.3 Smart UX")
 loader = instaloader.Instaloader(download_pictures=False, download_videos=False, save_metadata=False, quiet=True)
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
@@ -97,9 +97,10 @@ PLATFORM_LABELS = {
     "twitter": "X / Twitter",
     "soundcloud": "SoundCloud",
     "spotify": "Spotify",
+    "music": "Music Search",
     "generic": "Media",
 }
-PLATFORM_ICONS = {"instagram":"📸", "youtube":"▶️", "twitter":"𝕏", "soundcloud":"☁️", "spotify":"🟢", "generic":"🌐"}
+PLATFORM_ICONS = {"instagram":"📸", "youtube":"▶️", "twitter":"𝕏", "soundcloud":"☁️", "spotify":"🟢", "music":"🎵", "generic":"🌐"}
 
 
 def now_ts() -> int:
@@ -197,6 +198,14 @@ def init_db():
             CREATE TABLE IF NOT EXISTS error_logs (id BIGSERIAL PRIMARY KEY, user_id BIGINT, platform TEXT, error TEXT, created_at BIGINT NOT NULL);
             CREATE TABLE IF NOT EXISTS admin_state (admin_id BIGINT PRIMARY KEY, action TEXT NOT NULL, payload TEXT, updated_at BIGINT NOT NULL);
             CREATE TABLE IF NOT EXISTS admin_modes (admin_id BIGINT PRIMARY KEY, mode TEXT NOT NULL, updated_at BIGINT NOT NULL);
+            CREATE TABLE IF NOT EXISTS user_state (user_id BIGINT PRIMARY KEY, action TEXT NOT NULL, payload TEXT, updated_at BIGINT NOT NULL);
+            CREATE TABLE IF NOT EXISTS recent_downloads (
+                id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, platform TEXT, title TEXT,
+                media_type TEXT, quality TEXT, file_id TEXT NOT NULL, source_url TEXT, created_at BIGINT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_reports (
+                id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, job_id TEXT, platform TEXT, source_url TEXT, note TEXT, created_at BIGINT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS fastsaver_keys (
                 key_id TEXT PRIMARY KEY, key_secret TEXT UNIQUE NOT NULL, label TEXT,
                 priority INTEGER NOT NULL DEFAULT 100, enabled INTEGER NOT NULL DEFAULT 1,
@@ -229,6 +238,14 @@ def init_db():
             CREATE TABLE IF NOT EXISTS error_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, platform TEXT, error TEXT, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS admin_state (admin_id INTEGER PRIMARY KEY, action TEXT NOT NULL, payload TEXT, updated_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS admin_modes (admin_id INTEGER PRIMARY KEY, mode TEXT NOT NULL, updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS user_state (user_id INTEGER PRIMARY KEY, action TEXT NOT NULL, payload TEXT, updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS recent_downloads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, platform TEXT, title TEXT,
+                media_type TEXT, quality TEXT, file_id TEXT NOT NULL, source_url TEXT, created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, job_id TEXT, platform TEXT, source_url TEXT, note TEXT, created_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS fastsaver_keys (
                 key_id TEXT PRIMARY KEY, key_secret TEXT UNIQUE NOT NULL, label TEXT,
                 priority INTEGER NOT NULL DEFAULT 100, enabled INTEGER NOT NULL DEFAULT 1,
@@ -346,6 +363,66 @@ def user_downloads_today(user_id:int) -> int:
     start=now_ts()-86400
     with db() as conn:
         return conn.execute("SELECT COUNT(*) c FROM downloads WHERE user_id=? AND created_at>=?",(user_id,start)).fetchone()["c"]
+
+
+def user_download_stats(user_id: int) -> dict[str, Any]:
+    start=now_ts()-86400
+    with db() as conn:
+        total=conn.execute("SELECT COUNT(*) c FROM downloads WHERE user_id=?",(user_id,)).fetchone()["c"]
+        today=conn.execute("SELECT COUNT(*) c FROM downloads WHERE user_id=? AND created_at>=?",(user_id,start)).fetchone()["c"]
+        top=conn.execute("SELECT platform,COUNT(*) c FROM downloads WHERE user_id=? GROUP BY platform ORDER BY c DESC LIMIT 1",(user_id,)).fetchone()
+    return {"total":int(total or 0),"today":int(today or 0),"top":(top["platform"] if top else "-")}
+
+
+def set_user_state(user_id:int, action:str, payload:str="") -> None:
+    with db() as conn:
+        conn.execute("INSERT INTO user_state(user_id,action,payload,updated_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET action=excluded.action,payload=excluded.payload,updated_at=excluded.updated_at",(user_id,action,payload,now_ts()))
+
+
+def get_user_state(user_id:int):
+    with db() as conn:
+        row=conn.execute("SELECT action,payload,updated_at FROM user_state WHERE user_id=?",(user_id,)).fetchone()
+    if not row: return None
+    if int(row["updated_at"] or 0) < now_ts()-1800:
+        clear_user_state(user_id); return None
+    return (row["action"],row["payload"])
+
+
+def clear_user_state(user_id:int) -> None:
+    with db() as conn: conn.execute("DELETE FROM user_state WHERE user_id=?",(user_id,))
+
+
+def get_admin_state(admin_id:int):
+    with db() as conn:
+        row=conn.execute("SELECT action,payload FROM admin_state WHERE admin_id=?",(admin_id,)).fetchone()
+    return (row["action"],row["payload"]) if row else None
+
+
+def record_recent(user_id:int, platform:str, title:str, media_type:str, quality:str, file_id:str, source_url:str="") -> None:
+    if not file_id: return
+    with db() as conn:
+        conn.execute("INSERT INTO recent_downloads(user_id,platform,title,media_type,quality,file_id,source_url,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                     (user_id,platform,(title or "Media")[:300],media_type,quality,file_id,source_url,now_ts()))
+        # Keep the per-user list compact.
+        old=conn.execute("SELECT id FROM recent_downloads WHERE user_id=? ORDER BY id DESC LIMIT 1 OFFSET 29",(user_id,)).fetchone()
+        if old: conn.execute("DELETE FROM recent_downloads WHERE user_id=? AND id<=?",(user_id,old["id"]))
+
+
+def list_recent(user_id:int, limit:int=8):
+    with db() as conn:
+        return conn.execute("SELECT * FROM recent_downloads WHERE user_id=? ORDER BY id DESC LIMIT ?",(user_id,limit)).fetchall()
+
+
+def get_recent(user_id:int, recent_id:int):
+    with db() as conn:
+        return conn.execute("SELECT * FROM recent_downloads WHERE user_id=? AND id=?",(user_id,recent_id)).fetchone()
+
+
+def record_user_report(user_id:int, job_id:str, platform:str, source_url:str, note:str="user_report") -> None:
+    with db() as conn:
+        conn.execute("INSERT INTO user_reports(user_id,job_id,platform,source_url,note,created_at) VALUES(?,?,?,?,?,?)",
+                     (user_id,job_id,platform,source_url,note[:500],now_ts()))
+    log_error(user_id,platform,f"USER REPORT · job={job_id} · {note} · {source_url}")
 
 
 def set_admin_state(admin_id:int, action:str, payload:str="") -> None:
@@ -868,11 +945,23 @@ async def fastsaver_youtube_download(url: str, quality: str, outdir: Path) -> Pa
     dest = outdir / filename; await download_url(str(dl_url), dest); return dest
 
 
-async def fastsaver_search_music(query: str) -> dict[str, Any]:
+
+async def fastsaver_search_music_results(query: str, limit: int = 5) -> list[dict[str, Any]]:
     data = await fastsaver_json("GET", "/youtube/search", params={"query":query, "page":1}, timeout=90)
-    results = [x for x in (data.get("results") or []) if isinstance(x, dict) and x.get("video_id")]
-    if not results: raise RuntimeError("FastSaver/YouTube Music نتیجه‌ای برای این آهنگ پیدا نکرد.")
-    return results[0]
+    rows=[]
+    for x in (data.get("results") or []):
+        if not isinstance(x,dict) or not x.get("video_id"): continue
+        rows.append(x)
+        if len(rows)>=max(1,min(limit,8)): break
+    if not rows:
+        raise RuntimeError("FastSaver Music Search نتیجه‌ای پیدا نکرد.")
+    return rows
+
+async def fastsaver_search_music(query: str) -> dict[str, Any]:
+    rows=await fastsaver_search_music_results(query,1)
+    if not rows: raise RuntimeError("FastSaver/YouTube Music نتیجه‌ای برای این آهنگ پیدا نکرد.")
+    return rows[0]
+
 
 
 async def ensure_bot_username() -> str:
@@ -901,8 +990,9 @@ async def fastsaver_audio_file_id(video_id: str, cache_key: str, title: str, pla
     return str(file_id)
 
 
-async def send_audio_file_id(chat_id: int, file_id: str, caption: str) -> None:
-    await tg("sendAudio", {"chat_id":str(chat_id), "audio":file_id, "caption":caption, "parse_mode":"HTML"})
+async def send_audio_file_id(chat_id: int, file_id: str, caption: str):
+    return await tg("sendAudio", {"chat_id":str(chat_id), "audio":file_id, "caption":caption, "parse_mode":"HTML"})
+
 
 
 def spotify_oembed_sync(url: str) -> dict[str, Any]:
@@ -1017,40 +1107,40 @@ def build_keyboard(result: dict[str, Any], job_id: str) -> dict:
     rows: list[list[dict[str,str]]] = []
     platform = result.get("platform", "generic")
     if platform == "spotify":
-        rows.append([{"text":"🎵 دانلود MP3","callback_data":f"sp|{job_id}"}])
-        return {"inline_keyboard":rows}
-    for idx,item in enumerate(result["media"]):
-        title_idx = f" {idx+1}" if len(result["media"]) > 1 else ""
-        if item["type"] == "image":
-            rows.append([{"text":f"🖼 عکس{title_idx} · HQ","callback_data":f"d|{job_id}|i|{idx}|b"}])
-        elif item["type"] == "audio":
-            rows.append([
-                {"text":f"🎵 MP3 128{title_idx}","callback_data":f"a|{job_id}|{idx}|128"},
-                {"text":"🎵 MP3 192","callback_data":f"a|{job_id}|{idx}|192"},
-                {"text":"🎵 MP3 320","callback_data":f"a|{job_id}|{idx}|320"},
-            ])
-        elif item["type"] == "video":
-            qs = item.get("qualities") or []
-            if qs:
+        rows.append([{"text":"🎧 دانلود آهنگ","callback_data":f"sp|{job_id}"}])
+    elif platform == "music":
+        for idx,item in enumerate(result.get("media") or []):
+            title=str(item.get("title") or f"Result {idx+1}")
+            dur=human_duration(item.get("duration"))
+            label=f"🎵 {idx+1}. {title[:34]}" + (f" · {dur}" if dur else "")
+            rows.append([{"text":label,"callback_data":f"ms|{job_id}|{idx}"}])
+    else:
+        for idx,item in enumerate(result.get("media") or []):
+            title_idx = f" {idx+1}" if len(result.get("media") or []) > 1 else ""
+            if item["type"] == "image":
+                rows.append([{"text":f"🖼 عکس{title_idx} · HQ","callback_data":f"d|{job_id}|i|{idx}|b"}])
+            elif item["type"] == "audio":
+                rows.append([
+                    {"text":f"🎧 128k{title_idx}","callback_data":f"a|{job_id}|{idx}|128"},
+                    {"text":"🎧 192k","callback_data":f"a|{job_id}|{idx}|192"},
+                    {"text":"🎧 320k","callback_data":f"a|{job_id}|{idx}|320"},
+                ])
+            elif item["type"] == "video":
+                qs=item.get("qualities") or []
                 chunk=[]
-                for q in qs[:5]:
+                for q in qs[:6]:
                     chunk.append({"text":f"🎬 {q}p","callback_data":f"d|{job_id}|v|{idx}|{q}"})
-                    if len(chunk)==3:
-                        rows.append(chunk); chunk=[]
+                    if len(chunk)==3: rows.append(chunk); chunk=[]
                 if chunk: rows.append(chunk)
-            else:
-                rows.append([{"text":f"🎬 ویدیو{title_idx} · Best","callback_data":f"d|{job_id}|v|{idx}|b"}])
-            if item.get("has_audio"):
-                if platform == "youtube":
-                    rows.append([{"text":f"🎧 دانلود صوت{title_idx}","callback_data":f"a|{job_id}|{idx}|128"}])
-                else:
-                    rows.append([
-                        {"text":f"🎧 MP3 128{title_idx}","callback_data":f"a|{job_id}|{idx}|128"},
-                        {"text":"🎧 MP3 320","callback_data":f"a|{job_id}|{idx}|320"},
-                    ])
-    if len(result["media"]) > 1:
-        rows.append([{"text":"📥 دانلود همه · Best","callback_data":f"all|{job_id}"}])
+                if not qs:
+                    rows.append([{"text":f"🎬 ویدیو{title_idx} · Best","callback_data":f"d|{job_id}|v|{idx}|b"}])
+                if item.get("has_audio"):
+                    rows.append([{"text":f"🎧 فقط صدا{title_idx}","callback_data":f"a|{job_id}|{idx}|128"}])
+        if len(result.get("media") or []) > 1:
+            rows.append([{"text":"📥 دانلود همه · Best","callback_data":f"all|{job_id}"}])
+    rows.append([{"text":"🕘 اخیر","callback_data":"home|recent"},{"text":"🏠 خانه","callback_data":"home|home"}])
     return {"inline_keyboard":rows}
+
 
 
 def human_duration(sec: Any) -> str:
@@ -1063,34 +1153,31 @@ def human_duration(sec: Any) -> str:
 
 def result_text(result: dict[str, Any]) -> str:
     platform=result.get("platform","generic")
-    icon=PLATFORM_ICONS.get(platform,"🌐")
-    label=PLATFORM_LABELS.get(platform,platform)
+    icon=PLATFORM_ICONS.get(platform,"🌐"); label=PLATFORM_LABELS.get(platform,platform)
     media=result.get("media",[])
-    counts={t:sum(1 for x in media if x.get("type")==t) for t in ("image","video","audio")}
-    lines=[f"{icon} <b>{html.escape(label)} · آماده دانلود</b>",
-           f"📝 {html.escape(str(result.get('title') or 'Media'))[:180]}",
-           f"👤 {html.escape(str(result.get('owner') or label))}"]
-    if platform=="spotify":
-        kind=result.get("kind","track").title()
-        lines += [f"📦 نوع: <b>{kind}</b>","","🎵 خروجی: Telegram Audio · FastSaver","انتخاب کن 👇"]
+    if platform=="music":
+        lines=["🎵 <b>نتایج جستجوی موزیک</b>",f"🔎 {html.escape(str(result.get('title') or ''))}","",f"<b>{len(media)}</b> نتیجه پیدا شد. یکی رو انتخاب کن 👇"]
         return "\n".join(lines)
-    lines.append(f"📦 {len(media)} آیتم · 🖼 {counts['image']} · 🎬 {counts['video']} · 🎵 {counts['audio']}")
-    lines.append("")
-    for i,item in enumerate(media[:12],1):
-        typ=item.get("type")
-        if typ=="video":
-            q=", ".join(f"{x}p" for x in item.get("qualities") or []) or "Best"
-            desc=f"🎬 ویدیو — {q}"
-        elif typ=="audio": desc="🎵 صوت — MP3"
-        elif typ=="image": desc="🖼 عکس — HQ"
-        else: desc="📄 Media"
-        dur=human_duration(item.get("duration"))
-        title=(item.get("title") or "")[:55]
-        suffix=(f" · {html.escape(title)}" if title and len(media)>1 else "") + (f" · {dur}" if dur else "")
-        lines.append(f"{i}. {desc}{suffix}")
-    if len(media)>12: lines.append(f"… و {len(media)-12} آیتم دیگر")
-    lines += ["","کیفیت/فرمت رو انتخاب کن 👇"]
+    lines=[f"{icon} <b>{html.escape(label)}</b>",f"<b>{html.escape(str(result.get('title') or 'Media'))[:180]}</b>"]
+    owner=str(result.get('owner') or '').strip()
+    if owner: lines.append(f"👤 {html.escape(owner)[:100]}")
+    if platform=="spotify":
+        lines += ["","🎧 <b>Music-only</b> · FastSaver","⚡ Music Search + Music Download","","آماده‌ست؛ بزن دانلود 👇"]
+        return "\n".join(lines)
+    counts={t:sum(1 for x in media if x.get("type")==t) for t in ("image","video","audio")}
+    duration=human_duration(media[0].get("duration") if media else None)
+    summary=[]
+    if counts['image']: summary.append(f"🖼 {counts['image']}")
+    if counts['video']: summary.append(f"🎬 {counts['video']}")
+    if counts['audio']: summary.append(f"🎵 {counts['audio']}")
+    if duration: summary.append(f"⏱ {duration}")
+    if summary: lines.append(" · ".join(summary))
+    if platform=="youtube" and media:
+        qs=media[0].get("qualities") or []
+        if qs: lines.append("📺 کیفیت‌ها: "+", ".join(f"{q}p" for q in qs[:6]))
+    lines += ["","فرمت یا کیفیت رو انتخاب کن 👇"]
     return "\n".join(lines)
+
 
 
 async def download_url(url: str, dest: Path):
@@ -1202,129 +1289,121 @@ async def prepare_media(job: dict[str,Any], idx: int, quality: str, mode: str, t
     return path,"video",(f"{quality}p" if quality.isdigit() else "Best")
 
 
-async def send_file(chat_id:int,path:Path,kind:str,caption:str) -> bool:
+async def send_file(chat_id:int,path:Path,kind:str,caption:str):
     size_mb=path.stat().st_size/(1024*1024)
     if size_mb>MAX_SEND_MB:
         await send_text(chat_id,f"⚠️ فایل <b>{size_mb:.1f} MB</b> است و از سقف {MAX_SEND_MB} MB بیشتره. کیفیت پایین‌تر رو انتخاب کن.")
-        return False
+        return None
     if kind=="image": field,method,mime="photo","sendPhoto","image/jpeg"
     elif kind=="audio": field,method,mime="audio","sendAudio","audio/mpeg"
     else: field,method,mime="video","sendVideo","video/mp4"
     with path.open("rb") as f:
         data={"chat_id":str(chat_id),"caption":caption,"parse_mode":"HTML"}
         if kind=="video": data["supports_streaming"]="true"
-        await tg(method,data,{field:(path.name,f,mime)})
-    return True
+        return await tg(method,data,{field:(path.name,f,mime)})
+
 
 
 async def send_one(job:dict[str,Any],user_id:int,chat_id:int,idx:int,quality:str,mode:str):
     platform=job["result"].get("platform","generic")
-    if platform=="youtube" and mode=="audio":
-        try:
-            item=job["result"]["media"][idx]
-            video_id=str(item.get("id") or "")
-            if not video_id:
-                raise RuntimeError("YouTube video_id پیدا نشد.")
-            await send_text(chat_id,"🎧 دارم نسخه صوتی رو از FastSaver آماده می‌کنم…")
-            bot_username=(await ensure_bot_username()).lower()
-            cache_key=f"youtube:{video_id}:{bot_username}"
-            file_id=await fastsaver_audio_file_id(video_id,cache_key,job["result"].get("title","") or "", "youtube")
+    title=str((job["result"].get("media") or [{}])[idx].get("title") or job["result"].get("title") or "Media")
+    status=await send_text(chat_id,"⏳ <b>درخواست ثبت شد</b>\n▰▱▱▱ آماده‌سازی…")
+    try:
+        if platform=="youtube" and mode=="audio":
+            await edit_text(chat_id,status["message_id"],"🎵 <b>نسخه صوتی</b>\n▰▰▱▱ دریافت از FastSaver…")
+            item=job["result"]["media"][idx]; video_id=str(item.get("id") or "")
+            if not video_id: raise RuntimeError("YouTube video_id پیدا نشد.")
+            bot_username=(await ensure_bot_username()).lower(); cache_key=f"youtube:{video_id}:{bot_username}"
+            file_id=await fastsaver_audio_file_id(video_id,cache_key,title,"youtube")
+            await edit_text(chat_id,status["message_id"],"📤 <b>فایل آماده شد</b>\n▰▰▰▱ ارسال به تلگرام…")
             await send_audio_file_id(chat_id,file_id,f"{html.escape(BRAND_NAME)} · YouTube · Audio")
             record_download(user_id,job["job_id"],"audio","FastSaver TG file_id",0,"youtube")
-        except Exception as exc:
-            log.exception("youtube FastSaver audio failed")
-            await send_text(chat_id,"❌ دانلود صوت YouTube ناموفق بود.\n\n<code>"+html.escape(str(exc))[:900]+"</code>")
-        return
-    tmp=Path(tempfile.mkdtemp(prefix="bluegate_v4_"))
-    try:
-        await send_text(chat_id,f"⬇️ آیتم <b>{idx+1}</b> در حال آماده‌سازی…")
-        path,kind,qlabel=await prepare_media(job,idx,quality,mode,tmp)
-        ok=await send_file(chat_id,path,kind,f"{html.escape(BRAND_NAME)} · {PLATFORM_LABELS.get(platform,platform)} · {qlabel}")
-        if ok: record_download(user_id,job["job_id"],kind,qlabel,path.stat().st_size,platform)
+            record_recent(user_id,"youtube",title,"audio","Audio",file_id,job["source_url"])
+            await edit_text(chat_id,status["message_id"],"✅ <b>انجام شد</b>\nفایل صوتی ارسال شد.",done_keyboard(job["job_id"]))
+            return
+        tmp=Path(tempfile.mkdtemp(prefix="bluegate_v43_"))
+        try:
+            await edit_text(chat_id,status["message_id"],"⬇️ <b>در حال آماده‌سازی فایل</b>\n▰▰▱▱ لطفاً چند لحظه…")
+            path,kind,qlabel=await prepare_media(job,idx,quality,mode,tmp)
+            await edit_text(chat_id,status["message_id"],f"📤 <b>ارسال به تلگرام</b>\n▰▰▰▱ {html.escape(qlabel)}")
+            sent=await send_file(chat_id,path,kind,f"{html.escape(BRAND_NAME)} · {PLATFORM_LABELS.get(platform,platform)} · {qlabel}")
+            if sent:
+                record_download(user_id,job["job_id"],kind,qlabel,path.stat().st_size,platform)
+                fid=telegram_file_id(sent,kind)
+                if fid: record_recent(user_id,platform,title,kind,qlabel,fid,job["source_url"])
+                await edit_text(chat_id,status["message_id"],"✅ <b>دانلود کامل شد</b>\nفایل برات ارسال شد.",done_keyboard(job["job_id"]))
+            else:
+                await edit_text(chat_id,status["message_id"],"⚠️ فایل برای ارسال مستقیم بیش از حد بزرگ بود.",retry_keyboard(job["job_id"]))
+        finally:
+            shutil.rmtree(tmp,ignore_errors=True)
     except Exception as exc:
-        log.exception("send_one failed")
-        await send_text(chat_id,"❌ دانلود ناموفق بود.\n\n<code>"+html.escape(str(exc))[:900]+"</code>")
-    finally: shutil.rmtree(tmp,ignore_errors=True)
+        log_error(user_id,platform,exc); log.exception("send_one failed")
+        await edit_text(chat_id,status["message_id"],friendly_error_text(platform,exc),retry_keyboard(job["job_id"]))
+
 
 
 async def send_spotify(job:dict[str,Any],user_id:int,chat_id:int):
-    """Spotify Track -> FastSaver Music Search (2cr) -> Music Download/tg-bot (7cr).
-
-    IMPORTANT: Spotify must never call /youtube/download. The normal successful path
-    uses exactly one music search plus one music download (9 credits total) unless
-    the Telegram file_id is already cached locally, in which case the download call
-    is skipped.
-    """
+    """Spotify Track -> Music Search (2cr) -> Music Download/tg-bot (7cr)."""
+    status=await send_text(chat_id,"🟢 <b>Spotify</b>\n▰▱▱▱ خواندن اطلاعات آهنگ…")
     try:
         m=SPOTIFY_RE.search(job["source_url"])
-        if not m or m.group(1).lower() != "track":
-            raise RuntimeError("فعلاً فقط Spotify Track تکی پشتیبانی می‌شود.")
-
-        await send_text(chat_id,"🟢 Spotify شناسایی شد؛ Music Search → Music Download…")
+        if not m or m.group(1).lower() != "track": raise RuntimeError("فعلاً فقط Spotify Track تکی پشتیبانی می‌شود.")
         meta=await asyncio.to_thread(spotify_oembed_sync,job["source_url"])
-        title=str(meta.get("title") or job["result"].get("title") or "").strip()
-        artist=str(meta.get("author_name") or "").strip()
-        if not title:
-            raise RuntimeError("عنوان ترک Spotify پیدا نشد.")
-
-        # ONE search request only: FastSaver Music Search = 2 credits.
+        title=str(meta.get("title") or job["result"].get("title") or "").strip(); artist=str(meta.get("author_name") or "").strip()
+        if not title: raise RuntimeError("عنوان ترک Spotify پیدا نشد.")
         query=f"{artist} - {title}" if artist and artist.lower() not in title.lower() else title
-        log.info("spotify-music: Music Search (2cr) query=%r", query)
-        result=await fastsaver_search_music(query)
-        video_id=str(result.get("video_id") or "").strip()
-        if not video_id:
-            raise RuntimeError("FastSaver Music Search نتیجه معتبر با video_id نداد.")
-
-        # Music Download = /youtube/audio/tg-bot = 7 credits.
-        # This returns a Telegram file_id and does NOT use the Video Download endpoint.
-        bot_username=(await ensure_bot_username()).lower()
-        cache_key=f"spotify:{video_id}:{bot_username}"
+        await edit_text(chat_id,status["message_id"],"🔎 <b>Music Search</b>\n▰▰▱▱ پیدا کردن نسخه مناسب…")
+        log.info("spotify-music: Music Search (2cr) query=%r",query)
+        result=await fastsaver_search_music(query); video_id=str(result.get("video_id") or "").strip()
+        if not video_id: raise RuntimeError("Music Search نتیجه معتبر نداد.")
+        bot_username=(await ensure_bot_username()).lower(); cache_key=f"spotify:{video_id}:{bot_username}"
         cached=get_cached_file_id(cache_key)
         if cached:
-            log.info("spotify-music: cache hit; Music Download call skipped video_id=%s", video_id)
-            file_id=cached
-            qlabel="FastSaver Music cache"
+            file_id=cached; qlabel="FastSaver Music cache"
         else:
-            log.info("spotify-music: Music Download (7cr) video_id=%s", video_id)
+            await edit_text(chat_id,status["message_id"],"🎧 <b>Music Download</b>\n▰▰▰▱ آماده‌سازی فایل…")
+            log.info("spotify-music: Music Download (7cr) video_id=%s",video_id)
             file_id=await fastsaver_audio_file_id(video_id,cache_key,title,"spotify")
-            qlabel="FastSaver Music Search 2cr + Music Download 7cr"
-
-        caption=f"{html.escape(BRAND_NAME)} · Spotify · {html.escape(title)[:120]}"
-        await send_audio_file_id(chat_id,file_id,caption)
+            qlabel="Music Search 2cr + Music Download 7cr"
+        await edit_text(chat_id,status["message_id"],"📤 <b>فایل آماده‌ست</b>\n▰▰▰▱ ارسال به تلگرام…")
+        await send_audio_file_id(chat_id,file_id,f"{html.escape(BRAND_NAME)} · Spotify · {html.escape(title)[:120]}")
         record_download(user_id,job["job_id"],"audio",qlabel,0,"spotify")
-        await send_text(chat_id,"✅ Spotify Track ارسال شد.\n⚡ مسیر: Music Search + Music Download")
+        record_recent(user_id,"spotify",title,"audio","MP3",file_id,job["source_url"])
+        await edit_text(chat_id,status["message_id"],"✅ <b>Spotify Track ارسال شد</b>\n⚡ Music-only path",done_keyboard(job["job_id"]))
     except Exception as exc:
         log_error(user_id,"spotify",exc); log.exception("spotify-music failed")
-        await send_text(chat_id,"❌ دانلود Spotify ناموفق بود.\n\n<code>"+html.escape(str(exc))[:900]+"</code>")
+        await edit_text(chat_id,status["message_id"],friendly_error_text("spotify",exc),retry_keyboard(job["job_id"]))
+
 
 
 async def send_all(job:dict[str,Any],user_id:int,chat_id:int):
-    if job["result"].get("platform")=="spotify":
-        return await send_spotify(job,user_id,chat_id)
-    total=len(job["result"]["media"]); status=await send_text(chat_id,f"📥 دانلود همه شروع شد · <b>{total}</b> آیتم")
-    ok_count=0
-    for idx,item in enumerate(job["result"]["media"]):
+    if job["result"].get("platform")=="spotify": return await send_spotify(job,user_id,chat_id)
+    total=len(job["result"].get("media") or []); status=await send_text(chat_id,f"📥 <b>دانلود همه</b>\n0/{total} آماده شده")
+    ok_count=0; platform=job["result"].get("platform","generic")
+    for idx,item in enumerate(job["result"].get("media") or []):
         tmp=Path(tempfile.mkdtemp(prefix="bluegate_all_"))
         try:
-            mode="audio" if item.get("type")=="audio" else "video"
-            q="128" if mode=="audio" else "b"
+            await edit_text(chat_id,status["message_id"],f"📥 <b>دانلود همه</b>\nآیتم {idx+1}/{total} در حال آماده‌سازی…")
+            mode="audio" if item.get("type")=="audio" else "video"; q="128" if mode=="audio" else "b"
             path,kind,qlabel=await prepare_media(job,idx,q,mode,tmp)
-            ok=await send_file(chat_id,path,kind,f"{html.escape(BRAND_NAME)} · {idx+1}/{total} · {qlabel}")
-            if ok:
-                ok_count+=1; record_download(user_id,job["job_id"],kind,qlabel,path.stat().st_size,job["result"].get("platform","generic"))
+            sent=await send_file(chat_id,path,kind,f"{html.escape(BRAND_NAME)} · {idx+1}/{total} · {qlabel}")
+            if sent:
+                ok_count+=1; record_download(user_id,job["job_id"],kind,qlabel,path.stat().st_size,platform)
+                fid=telegram_file_id(sent,kind)
+                title=str(item.get("title") or job["result"].get("title") or f"Item {idx+1}")
+                if fid: record_recent(user_id,platform,title,kind,qlabel,fid,job["source_url"])
         except Exception as exc:
-            log.warning("download-all item %s failed: %s",idx,exc)
-            await send_text(chat_id,f"⚠️ آیتم {idx+1} دانلود نشد: <code>{html.escape(str(exc))[:180]}</code>")
+            log_error(user_id,platform,exc); log.warning("download-all item %s failed: %s",idx,exc)
         finally: shutil.rmtree(tmp,ignore_errors=True)
-    try: await edit_text(chat_id,status["message_id"],f"✅ دانلود همه تمام شد · <b>{ok_count}/{total}</b> فایل ارسال شد.")
-    except Exception: pass
+    await edit_text(chat_id,status["message_id"],f"✅ <b>دانلود همه تمام شد</b>\n{ok_count}/{total} فایل ارسال شد.",done_keyboard(job["job_id"]))
+
 
 
 def user_home_keyboard(user_id:int) -> dict:
     rows=[
-        [{"text":"📥 دانلود از لینک","callback_data":"home|download"},{"text":"🎵 موزیک","callback_data":"home|music"}],
-        [{"text":"📊 حساب من","callback_data":"home|account"},{"text":"🟢 وضعیت سرویس‌ها","callback_data":"home|services"}],
-        [{"text":"❓ راهنما","callback_data":"home|help"}],
+        [{"text":"📥 دانلود لینک","callback_data":"home|download"},{"text":"🎵 جستجوی موزیک","callback_data":"home|music"}],
+        [{"text":"🕘 دانلودهای اخیر","callback_data":"home|recent"},{"text":"📊 حساب من","callback_data":"home|account"}],
+        [{"text":"🟢 وضعیت سرویس‌ها","callback_data":"home|services"},{"text":"❓ راهنما","callback_data":"home|help"}],
     ]
     if SUPPORT_USERNAME:
         rows.append([{"text":"🆘 پشتیبانی","url":f"https://t.me/{SUPPORT_USERNAME}"}])
@@ -1333,12 +1412,18 @@ def user_home_keyboard(user_id:int) -> dict:
     return {"inline_keyboard":rows}
 
 
+
 async def send_user_home(chat_id:int,user_id:int,first_name:str=""):
-    used=user_downloads_today(user_id); lim=daily_limit(); remaining="نامحدود" if not lim else max(0,lim-used)
-    text=(f"👋 {html.escape(first_name) if first_name else ''}\n<b>{html.escape(BRAND_NAME)}</b>\n\n"
-          f"📥 دانلود امروز: <b>{used}</b>\n🎟 باقی‌مانده: <b>{remaining}</b>\n\n"
-          "لینک رو مستقیم بفرست یا از منوی پایین استفاده کن.")
+    st=user_download_stats(user_id); lim=daily_limit(); remaining="نامحدود" if not lim else max(0,lim-st["today"])
+    service_line=" · ".join(f"{PLATFORM_ICONS[p]}{'🟢' if service_enabled(p) else '🔴'}" for p in ("instagram","youtube","twitter","soundcloud","spotify"))
+    intro=("\n\n<b>سه قدم:</b> لینک رو بفرست ← فرمت/کیفیت رو انتخاب کن ← فایل رو بگیر." if st["total"]==0 else "")
+    text=(f"👋 {html.escape(first_name) if first_name else 'سلام'}\n"
+          f"<b>{html.escape(BRAND_NAME)}</b>\n\n"
+          f"{service_line}\n\n"
+          f"📥 امروز: <b>{st['today']}</b> · 🎟 باقی‌مانده: <b>{remaining}</b>{intro}\n\n"
+          "لینک رو مستقیم بفرست یا یکی از گزینه‌ها رو انتخاب کن 👇")
     await send_text(chat_id,text,user_home_keyboard(user_id))
+
 
 
 def admin_keyboard() -> dict:
@@ -1416,7 +1501,7 @@ async def send_admin_panel(chat_id:int):
     with db() as conn:
         banned=conn.execute("SELECT COUNT(*) c FROM bans").fetchone()["c"]
         errors24=conn.execute("SELECT COUNT(*) c FROM error_logs WHERE created_at>=?",(now_ts()-86400,)).fetchone()["c"]
-    lines=["🛡 <b>BlueGate Admin · V4.2</b>","",f"👥 کاربران: <b>{s['users']}</b> · 🚫 بن: <b>{banned}</b>",f"🟢 فعال ۲۴h: <b>{s['active24']}</b>",
+    lines=["🛡 <b>BlueGate Admin · V4.3</b>","",f"👥 کاربران: <b>{s['users']}</b> · 🚫 بن: <b>{banned}</b>",f"🟢 فعال ۲۴h: <b>{s['active24']}</b>",
            f"📥 دانلود کل: <b>{s['downloads']}</b> · امروز: <b>{s['downloads24']}</b>",f"❌ خطای ۲۴h: <b>{errors24}</b>",f"💾 حجم: <b>{gb:.2f} GB</b>",
            f"🚦 سقف روزانه: <b>{daily_limit() or 'نامحدود'}</b>",f"🛠 Maintenance: <b>{'ON' if bool_setting('maintenance',False) else 'OFF'}</b>",
            f"⚡ API Pool: <b>{pool['total']}</b> · Active <b>{pool['active']}</b> · Limited <b>{pool['rate_limited']}</b>",f"🗃 DB: <b>{db_backend()}</b>","","📊 <b>پلتفرم‌ها</b>"]
@@ -1442,7 +1527,7 @@ async def admin_system(chat_id:int):
     du=shutil.disk_usage('/tmp'); up=now_ts()-STARTED_AT; pool=fastsaver_pool_summary()
     text=(f"🩺 <b>System Status</b>\n\n✅ Bot: Online\n⏱ Uptime: <b>{up//3600}h {(up%3600)//60}m</b>\n"
           f"💽 /tmp free: <b>{du.free/(1024**3):.2f} GB</b>\n🗃 DB: <b>{db_backend()}</b>\n"
-          f"⚡ FastSaver Pool: <b>{pool['total']}</b> keys / <b>{pool['active']}</b> active\n📦 Version: <b>4.2.1</b>")
+          f"⚡ FastSaver Pool: <b>{pool['total']}</b> keys / <b>{pool['active']}</b> active\n📦 Version: <b>4.3.0</b>")
     await send_text(chat_id,text)
 
 
@@ -1501,7 +1586,221 @@ HELP_TEXT=(
 )
 
 
+
+def nav_home_keyboard() -> dict:
+    return {"inline_keyboard":[[{"text":"🕘 اخیر","callback_data":"home|recent"},{"text":"🏠 خانه","callback_data":"home|home"}]]}
+
+
+def done_keyboard(job_id:str) -> dict:
+    return {"inline_keyboard":[
+        [{"text":"🔁 کیفیت/فرمت دیگر","callback_data":f"again|{job_id}"}],
+        [{"text":"🕘 دانلودهای اخیر","callback_data":"home|recent"},{"text":"🏠 خانه","callback_data":"home|home"}],
+    ]}
+
+
+def retry_keyboard(job_id:str) -> dict:
+    return {"inline_keyboard":[
+        [{"text":"🔄 دوباره تلاش کن","callback_data":f"retry|{job_id}"},{"text":"⚠️ گزارش مشکل","callback_data":f"report|{job_id}"}],
+        [{"text":"🏠 خانه","callback_data":"home|home"}],
+    ]}
+
+def retry_music_keyboard(job_id:str, idx:int) -> dict:
+    return {"inline_keyboard":[
+        [{"text":"🔄 دوباره دانلود کن","callback_data":f"retryms|{job_id}|{idx}"},{"text":"⚠️ گزارش مشکل","callback_data":f"report|{job_id}"}],
+        [{"text":"🎵 نتایج جستجو","callback_data":f"again|{job_id}"},{"text":"🏠 خانه","callback_data":"home|home"}],
+    ]}
+
+
+def friendly_error_text(platform:str, exc:Exception|str) -> str:
+    raw=str(exc).lower(); label=PLATFORM_LABELS.get(platform,platform)
+    if "هیچ fastsaver api" in raw or "همه api" in raw:
+        detail="سرویس دانلود موزیک/YouTube موقتاً ظرفیت نداره. چند لحظه بعد دوباره امتحان کن."
+    elif "429" in raw or "rate limit" in raw:
+        detail="سرویس موقتاً شلوغه. بات می‌تونه با API بعدی تلاش کنه؛ چند ثانیه بعد Retry بزن."
+    elif "fetch.error" in raw or "نتیجه" in raw or "پیدا نکرد" in raw:
+        detail="این محتوا پیدا نشد یا منبعش فعلاً قابل دریافت نیست."
+    elif "private" in raw or "login" in raw or "cookie" in raw:
+        detail="این محتوا احتمالاً خصوصی یا نیازمند ورود به حسابه."
+    elif "too large" in raw or "بیشتر" in raw and "mb" in raw:
+        detail="فایل برای ارسال مستقیم بزرگه؛ کیفیت پایین‌تر رو انتخاب کن."
+    else:
+        detail="یه خطای موقت موقع آماده‌سازی پیش اومد. Retry کن؛ اگر تکرار شد گزارش مشکل رو بزن."
+    return f"❌ <b>{html.escape(label)} آماده نشد</b>\n\n{detail}"
+
+
+def telegram_file_id(result:Any, kind:str) -> str|None:
+    if not isinstance(result,dict): return None
+    try:
+        if kind=="audio": return (result.get("audio") or {}).get("file_id")
+        if kind=="video": return (result.get("video") or {}).get("file_id")
+        if kind=="image":
+            photos=result.get("photo") or []
+            return photos[-1].get("file_id") if photos else None
+    except Exception: return None
+    return None
+
+
+async def delete_message(chat_id:int,message_id:int) -> None:
+    try: await tg("deleteMessage",{"chat_id":str(chat_id),"message_id":str(message_id)})
+    except Exception: pass
+
+
+def preview_thumbnail(result:dict[str,Any]) -> str|None:
+    thumb=result.get("thumbnail")
+    if thumb: return str(thumb)
+    media=result.get("media") or []
+    if media and media[0].get("display_url"): return str(media[0].get("display_url"))
+    return None
+
+
+async def show_result_card(chat_id:int,result:dict[str,Any],job_id:str,status_message_id:int|None=None):
+    text=result_text(result); kb=build_keyboard(result,job_id); thumb=preview_thumbnail(result)
+    if thumb and result.get("platform")!="music":
+        try:
+            data={"chat_id":str(chat_id),"photo":thumb,"caption":text,"parse_mode":"HTML","reply_markup":json.dumps(kb,ensure_ascii=False)}
+            await tg("sendPhoto",data)
+            if status_message_id: await delete_message(chat_id,status_message_id)
+            return
+        except Exception as exc:
+            log.info("preview photo fallback to text: %s",exc)
+    if status_message_id:
+        try: await edit_text(chat_id,status_message_id,text,kb); return
+        except Exception: pass
+    await send_text(chat_id,text,kb)
+
+
+async def send_account_page(chat_id:int,user_id:int):
+    st=user_download_stats(user_id); lim=daily_limit(); rem="نامحدود" if not lim else max(0,lim-st["today"])
+    top=PLATFORM_LABELS.get(st["top"],st["top"])
+    await send_text(chat_id,
+        f"📊 <b>حساب من</b>\n\n📥 امروز: <b>{st['today']}</b> / <b>{lim or '∞'}</b>\n🎟 باقی‌مانده: <b>{rem}</b>\n📦 کل دانلودها: <b>{st['total']}</b>\n⭐ سرویس پرکاربرد: <b>{html.escape(top)}</b>\n\n⏳ محدودیت روی پنجره ۲۴ ساعته حساب میشه.",
+        nav_home_keyboard())
+
+
+async def send_services_page(chat_id:int):
+    lines=["🟢 <b>وضعیت سرویس‌ها</b>",""]
+    for p in ("instagram","youtube","twitter","soundcloud","spotify"):
+        lines.append(f"{'🟢' if service_enabled(p) else '🔴'} {PLATFORM_ICONS[p]} {PLATFORM_LABELS[p]}")
+    await send_text(chat_id,"\n".join(lines),nav_home_keyboard())
+
+
+async def send_recent_menu(chat_id:int,user_id:int):
+    rows=list_recent(user_id,8)
+    if not rows:
+        await send_text(chat_id,"🕘 <b>دانلودهای اخیر</b>\n\nهنوز چیزی اینجا نیست. اولین فایل رو دانلود کن 👇",nav_home_keyboard()); return
+    text="🕘 <b>دانلودهای اخیر</b>\n\nفایل‌های این بخش از Telegram cache دوباره ارسال می‌شن و API مصرف نمی‌کنن."
+    kb=[]
+    for r in rows:
+        icon=PLATFORM_ICONS.get(r["platform"],"📦"); title=str(r["title"] or "Media").replace("\n"," ")[:38]
+        kb.append([{"text":f"{icon} {title}","callback_data":f"recent|{r['id']}"}])
+    kb.append([{"text":"🏠 خانه","callback_data":"home|home"}])
+    await send_text(chat_id,text,{"inline_keyboard":kb})
+
+
+async def resend_recent(chat_id:int,user_id:int,recent_id:int):
+    r=get_recent(user_id,recent_id)
+    if not r: return await send_text(chat_id,"⌛️ این آیتم دیگه در سابقه موجود نیست.",nav_home_keyboard())
+    data={"chat_id":str(chat_id),"caption":f"{html.escape(BRAND_NAME)} · از دانلودهای اخیر","parse_mode":"HTML"}
+    kind=r["media_type"]
+    if kind=="image": data["photo"]=r["file_id"]; await tg("sendPhoto",data)
+    elif kind=="video": data["video"]=r["file_id"]; data["supports_streaming"]="true"; await tg("sendVideo",data)
+    else: data["audio"]=r["file_id"]; await tg("sendAudio",data)
+    record_download(user_id,"recent","cached",str(r["quality"] or "cached"),0,str(r["platform"] or "generic"))
+
+
+async def process_music_search(chat_id:int,user_id:int,query:str):
+    if not service_enabled("youtube"):
+        return await send_text(chat_id,"🔴 جستجوی موزیک فعلاً غیرفعاله.",nav_home_keyboard())
+    status=await send_text(chat_id,"🔎 <b>Music Search</b>\n▰▱▱ جستجو در حال انجامه…")
+    try:
+        rows=await fastsaver_search_music_results(query,5)
+        media=[]
+        for x in rows:
+            media.append({"type":"audio","id":str(x.get("video_id")),"title":str(x.get("title") or "Music")[:180],
+                          "duration":x.get("duration"),"owner":x.get("channel") or x.get("author"),"thumbnail":x.get("thumbnail")})
+        result={"platform":"music","kind":"search","title":query[:180],"owner":"FastSaver Music Search","media":media}
+        job_id=save_job(user_id,chat_id,"music-search:"+query,result)
+        await edit_text(chat_id,status["message_id"],result_text(result),build_keyboard(result,job_id))
+    except Exception as exc:
+        log_error(user_id,"youtube",exc); log.exception("music search failed")
+        failed={"platform":"music","kind":"failed","title":query[:180],"media":[],"failed_analysis":True,"music_query":query}
+        job_id=save_job(user_id,chat_id,"music-search:"+query,failed)
+        await edit_text(chat_id,status["message_id"],friendly_error_text("youtube",exc),retry_keyboard(job_id))
+
+
+async def send_music_search_item(job:dict[str,Any],user_id:int,chat_id:int,idx:int):
+    item=job["result"]["media"][idx]; video_id=str(item.get("id") or ""); title=str(item.get("title") or "Music")
+    status=await send_text(chat_id,"🎧 <b>Music Download</b>\n▰▰▱ آماده‌سازی فایل…")
+    try:
+        bot_username=(await ensure_bot_username()).lower(); cache_key=f"music:{video_id}:{bot_username}"
+        file_id=await fastsaver_audio_file_id(video_id,cache_key,title,"youtube")
+        await edit_text(chat_id,status["message_id"],"📤 <b>فایل آماده شد</b>\n▰▰▰ ارسال به تلگرام…")
+        await send_audio_file_id(chat_id,file_id,f"{html.escape(BRAND_NAME)} · {html.escape(title)[:120]}")
+        record_download(user_id,job["job_id"],"audio","Music Search + Download",0,"youtube")
+        record_recent(user_id,"youtube",title,"audio","Music",file_id,job["source_url"])
+        await edit_text(chat_id,status["message_id"],"✅ <b>آهنگ ارسال شد</b>",done_keyboard(job["job_id"]))
+    except Exception as exc:
+        log_error(user_id,"youtube",exc); log.exception("music item failed")
+        await edit_text(chat_id,status["message_id"],friendly_error_text("youtube",exc),retry_music_keyboard(job["job_id"],idx))
+
+
+async def process_url_message(message:dict[str,Any],url:str):
+    chat_id=message["chat"]["id"]; user=message.get("from",{}); user_id=user.get("id",chat_id)
+    platform=detect_platform(url)
+    if not service_enabled(platform): return await send_text(chat_id,f"🔴 {PLATFORM_LABELS.get(platform,platform)} فعلاً غیرفعاله.",nav_home_keyboard())
+    lim=daily_limit()
+    if user_id not in ADMIN_IDS and lim and user_downloads_today(user_id)>=lim:
+        return await send_text(chat_id,f"🚦 سقف دانلود ۲۴ ساعته‌ات ({lim}) پر شده.",nav_home_keyboard())
+    if platform=="generic": return await send_text(chat_id,"❌ این لینک فعلاً پشتیبانی نمی‌شه.",nav_home_keyboard())
+    status=await send_text(chat_id,f"{PLATFORM_ICONS.get(platform,'🌐')} <b>بررسی لینک</b>\n▰▱▱▱ تشخیص محتوا…")
+    try:
+        result=await analyze(url); job_id=save_job(user_id,chat_id,url,result)
+        await edit_text(chat_id,status["message_id"],f"{PLATFORM_ICONS.get(platform,'🌐')} <b>اطلاعات آماده شد</b>\n▰▰▰▱ ساخت گزینه‌های دانلود…")
+        await show_result_card(chat_id,result,job_id,status["message_id"])
+    except Exception as exc:
+        log_error(user_id,platform,exc); log.exception("analyze failed")
+        failed={"platform":platform,"kind":"failed","title":"Download request","media":[],"failed_analysis":True}
+        job_id=save_job(user_id,chat_id,url,failed)
+        await edit_text(chat_id,status["message_id"],friendly_error_text(platform,exc),retry_keyboard(job_id))
+
+
+async def retry_job(chat_id:int,user_id:int,job:dict[str,Any]):
+    source=job["source_url"]
+    if source.startswith("music-search:"):
+        return await process_music_search(chat_id,user_id,source.split(":",1)[1])
+    status=await send_text(chat_id,"🔄 <b>تلاش دوباره</b>\n▰▱▱▱ بررسی لینک…")
+    try:
+        result=await analyze(source); new_id=save_job(user_id,chat_id,source,result)
+        await show_result_card(chat_id,result,new_id,status["message_id"])
+    except Exception as exc:
+        platform=job["result"].get("platform","generic"); log_error(user_id,platform,exc)
+        await edit_text(chat_id,status["message_id"],friendly_error_text(platform,exc),retry_keyboard(job["job_id"]))
+
+
 async def handle_message(message:dict[str,Any]):
+    user=message.get("from",{}); user_id=user.get("id",message["chat"]["id"]); upsert_user(user)
+    text=message.get("text") or message.get("caption") or ""
+    # Admin input flows are intentionally delegated unchanged.
+    if user_id in ADMIN_IDS and get_admin_state(user_id) and not text.startswith("/"):
+        return await handle_message_legacy(message)
+    if text.startswith("/"):
+        clear_user_state(user_id)
+        return await handle_message_legacy(message)
+    if user_id not in ADMIN_IDS and (is_banned(user_id) or bool_setting("maintenance",False)):
+        return await handle_message_legacy(message)
+    chat_id=message["chat"]["id"]
+    if not await ensure_joined(user_id,chat_id): return
+    url=clean_url(text)
+    if url:
+        clear_user_state(user_id)
+        return await process_url_message(message,url)
+    state=get_user_state(user_id)
+    if state and state[0]=="music_search" and text.strip():
+        clear_user_state(user_id)
+        return await process_music_search(chat_id,user_id,text.strip())
+    return await handle_message_legacy(message)
+
+async def handle_message_legacy(message:dict[str,Any]):
     chat_id=message["chat"]["id"]; user=message.get("from",{}); user_id=user.get("id",chat_id); upsert_user(user)
     text=message.get("text") or message.get("caption") or ""; msg_id=message.get("message_id")
     if user_id in ADMIN_IDS:
@@ -1552,7 +1851,7 @@ async def handle_message(message:dict[str,Any]):
         await edit_text(chat_id,status["message_id"],f"❌ نتونستم لینک رو بخونم.\n\n💡 {hints.get(platform,'')}\n\n<code>{html.escape(str(exc))[:500]}</code>")
 
 
-async def handle_callback(cb:dict[str,Any]):
+async def handle_callback_legacy(cb:dict[str,Any]):
     cb_id=cb["id"]; message=cb.get("message") or {}; chat_id=message.get("chat",{}).get("id")
     user=cb.get("from",{}); user_id=user.get("id"); data=cb.get("data",""); upsert_user(user)
     if data=="noop": await safe_answer_callback(cb_id); return
@@ -1665,6 +1964,63 @@ async def handle_callback(cb:dict[str,Any]):
         await send_one(job,user_id,chat_id,idx,quality,"video"); return
 
 
+
+async def handle_callback(cb:dict[str,Any]):
+    cb_id=cb["id"]; message=cb.get("message") or {}; chat_id=message.get("chat",{}).get("id")
+    user=cb.get("from",{}); user_id=user.get("id"); data=cb.get("data",""); upsert_user(user)
+    if not chat_id: return await handle_callback_legacy(cb)
+    user_ux = data.startswith(("home|","recent|","again|","retry|","retryms|","report|","ms|"))
+    if user_ux and user_id not in ADMIN_IDS and is_banned(user_id):
+        await safe_answer_callback(cb_id,"دسترسی مسدود است.",True); return
+    if user_ux and user_id not in ADMIN_IDS and bool_setting("maintenance",False):
+        await safe_answer_callback(cb_id,"بات در حال بروزرسانی است.",True); return
+    if user_ux and not await is_joined(user_id):
+        await safe_answer_callback(cb_id,"اول عضو کانال شو.",True); await send_text(chat_id,"🔒 اول عضویتت رو تأیید کن.",join_keyboard()); return
+    if data.startswith("home|"):
+        await safe_answer_callback(cb_id); action=data.split("|",1)[1]
+        if action=="home": return await send_user_home(chat_id,user_id,user.get("first_name",""))
+        if action=="download":
+            clear_user_state(user_id)
+            return await send_text(chat_id,"📥 <b>دانلود از لینک</b>\n\nلینک Instagram / YouTube / X / SoundCloud / Spotify رو بفرست؛ نوع محتوا خودکار تشخیص داده میشه.",nav_home_keyboard())
+        if action=="music":
+            set_user_state(user_id,"music_search")
+            return await send_text(chat_id,"🎵 <b>جستجوی موزیک</b>\n\nاسم آهنگ یا Artist رو بنویس. مثال:\n<code>The Weeknd Blinding Lights</code>\n\nیا اگر لینک Spotify/YouTube داری، همون رو مستقیم بفرست.",nav_home_keyboard())
+        if action=="recent": return await send_recent_menu(chat_id,user_id)
+        if action=="account": return await send_account_page(chat_id,user_id)
+        if action=="services": return await send_services_page(chat_id)
+        if action=="help": return await send_text(chat_id,HELP_TEXT,nav_home_keyboard())
+    if data.startswith("recent|"):
+        await safe_answer_callback(cb_id,"در حال ارسال…")
+        try: return await resend_recent(chat_id,user_id,int(data.split("|",1)[1]))
+        except Exception as exc:
+            log_error(user_id,"recent",exc); return await send_text(chat_id,"❌ ارسال از سابقه ناموفق بود.",nav_home_keyboard())
+    if data.startswith("again|"):
+        await safe_answer_callback(cb_id); job=load_job(data.split("|",1)[1])
+        if not job or job["user_id"]!=user_id: return await send_text(chat_id,"⌛️ این درخواست منقضی شده؛ لینک رو دوباره بفرست.",nav_home_keyboard())
+        return await show_result_card(chat_id,job["result"],job["job_id"])
+    if data.startswith("retryms|"):
+        await safe_answer_callback(cb_id,"دوباره دانلود می‌کنم…")
+        _,jid,idx_s=data.split("|",2); job=load_job(jid)
+        if not job or job["user_id"]!=user_id: return await send_text(chat_id,"⌛️ نتایج جستجو منقضی شدن.",nav_home_keyboard())
+        return await send_music_search_item(job,user_id,chat_id,int(idx_s))
+    if data.startswith("retry|"):
+        await safe_answer_callback(cb_id,"دوباره امتحان می‌کنم…"); job=load_job(data.split("|",1)[1])
+        if not job or job["user_id"]!=user_id: return await send_text(chat_id,"⌛️ درخواست منقضی شده.",nav_home_keyboard())
+        return await retry_job(chat_id,user_id,job)
+    if data.startswith("report|"):
+        await safe_answer_callback(cb_id,"گزارش شد ✅"); job=load_job(data.split("|",1)[1])
+        if job and job["user_id"]==user_id:
+            p=job["result"].get("platform","generic"); record_user_report(user_id,job["job_id"],p,job["source_url"])
+        return
+    if data.startswith("ms|"):
+        await safe_answer_callback(cb_id,"آماده‌سازی آهنگ…")
+        _,jid,idx_s=data.split("|",2); job=load_job(jid)
+        if not job or job["user_id"]!=user_id: return await send_text(chat_id,"⌛️ نتایج جستجو منقضی شدن؛ دوباره سرچ کن.",nav_home_keyboard())
+        try: idx=int(idx_s); return await send_music_search_item(job,user_id,chat_id,idx)
+        except Exception as exc:
+            log_error(user_id,"youtube",exc); return await send_text(chat_id,friendly_error_text("youtube",exc),retry_keyboard(jid))
+    return await handle_callback_legacy(cb)
+
 @app.on_event("startup")
 async def startup():
     init_db()
@@ -1682,11 +2038,11 @@ async def startup():
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
-async def root(): return PlainTextResponse(f"{BRAND_NAME} V4.2 is running ✅")
+async def root(): return PlainTextResponse(f"{BRAND_NAME} V4.3 is running ✅")
 
 
 @app.get("/health")
-async def health(): return JSONResponse({"ok":True,"version":"4.2.1","platforms":["instagram","youtube","twitter","soundcloud","spotify"],"youtube_provider":"FastSaverAPI","spotify_provider":"FastSaverAPI"})
+async def health(): return JSONResponse({"ok":True,"version":"4.3.0","platforms":["instagram","youtube","twitter","soundcloud","spotify"],"youtube_provider":"FastSaverAPI","spotify_provider":"FastSaverAPI"})
 
 
 @app.post("/telegram/{secret}")

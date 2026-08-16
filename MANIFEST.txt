@@ -1,4 +1,4 @@
-BlueGate Downloader V4.2 FULL ROOT
+BlueGate Downloader V4.3 SMART UX FULL ROOT
 
 Required runtime files:
 - main.py
@@ -11,8 +11,10 @@ Configuration/docs:
 - .env.example
 - .gitignore
 - README.md
+- USER_UX_V4_3.md
 - NEON_SETUP.md
-- ADMIN_V4_2.md
+- ADMIN_V4_3.md
 - FASTSAVER_SETUP.md
+- SPOTIFY_MUSIC_PATH.md
 - VERSION
 - MANIFEST.txt
