@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me").strip()
 COOKIE_FILE = os.getenv("COOKIE_FILE", "").strip()
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "").strip()
+INSTAGRAM_SESSION_B64 = os.getenv("INSTAGRAM_SESSION_B64", "").strip()
+INSTAGRAM_SESSION_FILE = os.getenv("INSTAGRAM_SESSION_FILE", "").strip()
+INSTAGRAM_COOKIE_FILE = ""
 YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
 YOUTUBE_COOKIES_B64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
 MAX_SEND_MB = int(os.getenv("MAX_SEND_MB", "49"))
@@ -87,17 +92,78 @@ def prepare_runtime_cookies() -> None:
 
 prepare_runtime_cookies()
 
+def prepare_runtime_instagram_session() -> None:
+    """Materialize an Instaloader session from a Render secret when configured."""
+    global INSTAGRAM_SESSION_FILE
+    if not INSTAGRAM_SESSION_B64:
+        return
+    target = Path("/tmp/instagram.session")
+    try:
+        raw = base64.b64decode(INSTAGRAM_SESSION_B64, validate=True)
+        target.write_bytes(raw)
+        os.chmod(target, 0o600)
+        INSTAGRAM_SESSION_FILE = str(target)
+        log.info("Instagram session file loaded from INSTAGRAM_SESSION_B64")
+    except Exception as exc:
+        log.error("Could not decode INSTAGRAM_SESSION_B64: %s", exc)
+
+prepare_runtime_instagram_session()
+
 if not BOT_TOKEN:
     log.warning("BOT_TOKEN is not set")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 app = FastAPI(title="BlueGate Downloader")
-loader = instaloader.Instaloader(download_pictures=False, download_videos=False, save_metadata=False, quiet=True)
+loader = instaloader.Instaloader(download_pictures=False, download_videos=False, save_metadata=False, quiet=True, sleep=True)
+_INSTAGRAM_LOCK = threading.Lock()
+INSTAGRAM_SESSION_READY = False
+
+def _write_instagram_netscape_cookies() -> str:
+    """Export the loaded Instaloader cookie jar for yt-dlp fallback requests."""
+    global INSTAGRAM_COOKIE_FILE
+    if not loader.context.is_logged_in:
+        return ""
+    try:
+        cookies = loader.save_session()
+        target = Path("/tmp/instagram_cookies.txt")
+        lines = ["# Netscape HTTP Cookie File", "# Generated at runtime from the configured Instaloader session"]
+        for name, value in cookies.items():
+            if not value:
+                continue
+            lines.append(f".instagram.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}")
+        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.chmod(target, 0o600)
+        INSTAGRAM_COOKIE_FILE = str(target)
+        return INSTAGRAM_COOKIE_FILE
+    except Exception as exc:
+        log.warning("Could not export Instagram cookies for fallback: %s", exc)
+        return ""
+
+def configure_instagram_session() -> None:
+    global INSTAGRAM_SESSION_READY
+    if not INSTAGRAM_USERNAME or not INSTAGRAM_SESSION_FILE:
+        log.info("Instagram authenticated session not configured; public post fallback only")
+        return
+    path = Path(INSTAGRAM_SESSION_FILE)
+    if not path.exists():
+        log.warning("INSTAGRAM_SESSION_FILE does not exist: %s", path)
+        return
+    try:
+        loader.load_session_from_file(INSTAGRAM_USERNAME, str(path))
+        INSTAGRAM_SESSION_READY = bool(loader.context.is_logged_in)
+        _write_instagram_netscape_cookies()
+        log.info("Instagram authenticated session loaded for @%s", INSTAGRAM_USERNAME)
+    except Exception as exc:
+        INSTAGRAM_SESSION_READY = False
+        log.error("Instagram session load failed: %s", exc)
+
+configure_instagram_session()
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
 POST_RE = re.compile(r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", re.I)
-STORY_RE = re.compile(r"https?://(?:www\.)?instagram\.com/stories/[^\s?#]+(?:/\d+)?/?", re.I)
-HIGHLIGHT_RE = re.compile(r"https?://(?:www\.)?instagram\.com/stories/highlights/\d+/?", re.I)
+HIGHLIGHT_RE = re.compile(r"https?://(?:www\.)?instagram\.com/stories/highlights/(\d+)/?", re.I)
+STORY_ITEM_RE = re.compile(r"https?://(?:www\.)?instagram\.com/stories/([A-Za-z0-9._]+)/(\d+)/?", re.I)
+STORY_PROFILE_RE = re.compile(r"https?://(?:www\.)?instagram\.com/stories/([A-Za-z0-9._]+)/?", re.I)
 SPOTIFY_RE = re.compile(r"https?://open\.spotify\.com/(track|album|playlist)/([A-Za-z0-9]+)", re.I)
 
 PLATFORM_LABELS = {
@@ -854,7 +920,7 @@ def detect_platform(url: str) -> str:
 
 def instagram_kind(url: str) -> str:
     if HIGHLIGHT_RE.match(url): return "highlight"
-    if STORY_RE.match(url): return "story"
+    if STORY_ITEM_RE.match(url) or STORY_PROFILE_RE.match(url): return "story"
     if POST_RE.match(url): return "post"
     return "unknown"
 
@@ -865,7 +931,12 @@ def ydl_options(skip_download: bool = True, platform: str = "generic", *, youtub
         "noplaylist": False, "socket_timeout": 45,
         "extract_flat": False,
     }
-    cookie = YOUTUBE_COOKIE_FILE if platform == "youtube" and YOUTUBE_COOKIE_FILE else COOKIE_FILE
+    if platform == "youtube" and YOUTUBE_COOKIE_FILE:
+        cookie = YOUTUBE_COOKIE_FILE
+    elif platform == "instagram" and INSTAGRAM_COOKIE_FILE:
+        cookie = INSTAGRAM_COOKIE_FILE
+    else:
+        cookie = COOKIE_FILE
     if cookie and Path(cookie).exists() and not (platform == "youtube" and youtube_no_cookie):
         opts["cookiefile"] = cookie
 
@@ -958,24 +1029,158 @@ def shortcode_from_url(url: str) -> str:
     return m.group(1)
 
 
+def _require_instagram_session() -> None:
+    if not INSTAGRAM_SESSION_READY or not loader.context.is_logged_in:
+        raise RuntimeError("Instagram session تنظیم نشده یا معتبر نیست. برای Story/Highlight باید Session اکانت بات روی Render تنظیم شود.")
+
+
+def _story_media(item: Any, playlist_index: int, owner: str = "instagram") -> dict[str, Any]:
+    is_video = bool(getattr(item, "is_video", False))
+    display_url = str(getattr(item, "url", "") or "")
+    video_url = str(getattr(item, "video_url", "") or "") if is_video else None
+    caption = str(getattr(item, "caption", "") or "")
+    media_id = str(getattr(item, "mediaid", "") or "")
+    return {
+        "type": "video" if is_video else "image",
+        "display_url": display_url,
+        "video_url": video_url,
+        "qualities": [],
+        "playlist_index": playlist_index,
+        "has_audio": False,
+        "title": (caption or f"Instagram Story {playlist_index}")[:180],
+        "id": media_id,
+        "owner": owner,
+    }
+
+
 def analyze_instagram_post(url: str) -> dict[str, Any]:
-    post = instaloader.Post.from_shortcode(loader.context, shortcode_from_url(url))
-    if post.typename == "GraphSidecar":
-        nodes = list(post.get_sidecar_nodes())
-        media = [{"type":"video" if n.is_video else "image", "display_url":n.display_url,
-                  "video_url":n.video_url if n.is_video else None, "qualities":[], "playlist_index":i+1}
-                 for i,n in enumerate(nodes)]
-    else:
-        media = [{"type":"video" if post.is_video else "image", "display_url":post.url,
-                  "video_url":post.video_url if post.is_video else None, "qualities":[], "playlist_index":1}]
-    yt_entries = flatten_entries(extract_yt_info(url, "instagram"))
-    for i,item in enumerate(media):
-        if item["type"] == "video":
-            entry = yt_entries[i] if i < len(yt_entries) else (yt_entries[0] if yt_entries else None)
-            item["qualities"] = quality_list(entry)
-            item["has_audio"] = entry_has_audio(entry or {})
-    return {"platform":"instagram","kind":"post","url":url,"title":(post.caption or "Instagram media")[:180],
-            "owner":getattr(post.owner_profile,"username","instagram"),"media":media}
+    # Serialize Instaloader metadata calls. This avoids several simultaneous Instagram
+    # requests from one Render IP and lets Instaloader's own RateController do its job.
+    with _INSTAGRAM_LOCK:
+        try:
+            post = instaloader.Post.from_shortcode(loader.context, shortcode_from_url(url))
+        except Exception as primary_exc:
+            # Public fallback keeps Reels/public posts usable even when the configured
+            # Instagram session is temporarily invalid.
+            log.warning("Instaloader post metadata failed; trying yt-dlp fallback: %s", primary_exc)
+            fallback = analyze_generic_ydl(url, "instagram", "post")
+            return fallback
+
+        if post.typename == "GraphSidecar":
+            nodes = list(post.get_sidecar_nodes())
+            media = [{
+                "type": "video" if n.is_video else "image",
+                "display_url": str(n.display_url),
+                "video_url": str(n.video_url) if n.is_video and n.video_url else None,
+                "qualities": [],
+                "playlist_index": i + 1,
+                "has_audio": False,
+                "title": f"Instagram media {i+1}",
+            } for i, n in enumerate(nodes)]
+        else:
+            media = [{
+                "type": "video" if post.is_video else "image",
+                "display_url": str(post.url),
+                "video_url": str(post.video_url) if post.is_video and post.video_url else None,
+                "qualities": [],
+                "playlist_index": 1,
+                "has_audio": False,
+                "title": (post.caption or "Instagram media")[:180],
+            }]
+        return {
+            "platform": "instagram", "kind": "post", "url": url,
+            "title": (post.caption or "Instagram media")[:180],
+            "owner": getattr(post.owner_profile, "username", "instagram"), "media": media,
+        }
+
+
+def _find_story_item_by_scan(username: str, media_id: int | None = None) -> tuple[Any, str]:
+    profile = instaloader.Profile.from_username(loader.context, username)
+    stories = list(loader.get_stories([profile.userid]))
+    if not stories:
+        raise RuntimeError("Story فعالی برای این اکانت پیدا نشد یا اکانت بات اجازه دیدنش را ندارد.")
+    for story in stories:
+        items = list(story.get_items())
+        if media_id is None:
+            if items:
+                return items[-1], profile.username
+        else:
+            for item in items:
+                if int(getattr(item, "mediaid", 0) or 0) == media_id:
+                    return item, profile.username
+    raise RuntimeError("این Story پیدا نشد؛ ممکن است منقضی شده باشد یا اکانت بات به آن دسترسی نداشته باشد.")
+
+
+def analyze_instagram_story(url: str) -> dict[str, Any]:
+    _require_instagram_session()
+    m = STORY_ITEM_RE.search(url)
+    pm = STORY_PROFILE_RE.search(url)
+    if not (m or pm):
+        raise ValueError("لینک Instagram Story معتبر نیست.")
+    username = (m.group(1) if m else pm.group(1)).lower()
+    media_id = int(m.group(2)) if m else None
+    with _INSTAGRAM_LOCK:
+        if media_id is not None:
+            try:
+                item = instaloader.StoryItem.from_mediaid(loader.context, media_id)
+                # Verify/resolve owner; if Instagram's direct StoryItem query changed,
+                # scanning the active story below is a reliable fallback.
+                owner = getattr(item, "owner_username", None) or username
+                media = [_story_media(item, 1, owner)]
+            except Exception as exc:
+                log.warning("StoryItem.from_mediaid failed, scanning active story: %s", exc)
+                item, owner = _find_story_item_by_scan(username, media_id)
+                media = [_story_media(item, 1, owner)]
+        else:
+            profile = instaloader.Profile.from_username(loader.context, username)
+            stories = list(loader.get_stories([profile.userid]))
+            items = []
+            for story in stories:
+                items.extend(list(story.get_items()))
+            if not items:
+                raise RuntimeError("Story فعالی برای این اکانت پیدا نشد یا اکانت بات اجازه دیدنش را ندارد.")
+            media = [_story_media(item, i + 1, profile.username) for i, item in enumerate(items)]
+            owner = profile.username
+    return {
+        "platform": "instagram", "kind": "story", "url": url,
+        "title": f"Instagram Story · @{owner}", "owner": owner, "media": media,
+    }
+
+
+def analyze_instagram_highlight(url: str) -> dict[str, Any]:
+    _require_instagram_session()
+    m = HIGHLIGHT_RE.search(url)
+    if not m:
+        raise ValueError("لینک Instagram Highlight معتبر نیست.")
+    highlight_id = m.group(1)
+    with _INSTAGRAM_LOCK:
+        # Instaloader's Highlight.get_items() uses this same reel query internally.
+        data = loader.context.graphql_query(
+            "45246d3fe16ccc6577e0bd297a5db1ab",
+            {"reel_ids": [], "tag_names": [], "location_ids": [],
+             "highlight_reel_ids": [highlight_id], "precomposed_overlay": False}
+        )
+        reels = (data.get("data") or {}).get("reels_media") or []
+        if not reels:
+            raise RuntimeError("Highlight پیدا نشد یا اکانت بات اجازه دیدنش را ندارد.")
+        reel = reels[0]
+        owner_node = reel.get("owner") or reel.get("user") or {}
+        owner = str(owner_node.get("username") or "instagram")
+        title = str(reel.get("title") or "Instagram Highlight")[:180]
+        items = reel.get("items") or []
+        if not items:
+            raise RuntimeError("این Highlight آیتم قابل دانلودی ندارد.")
+        owner_profile = None
+        try:
+            if owner_node.get("id"):
+                owner_profile = instaloader.Profile.from_id(loader.context, int(owner_node["id"]))
+        except Exception:
+            owner_profile = None
+        media = []
+        for i, node in enumerate(items):
+            item = instaloader.StoryItem(loader.context, node, owner_profile)
+            media.append(_story_media(item, i + 1, owner))
+    return {"platform":"instagram","kind":"highlight","url":url,"title":title,"owner":owner,"media":media}
 
 
 def analyze_generic_ydl(url: str, platform: str, kind: str | None = None) -> dict[str, Any]:
@@ -1255,7 +1460,8 @@ def analyze_sync(url: str) -> dict[str, Any]:
     if platform == "instagram":
         kind = instagram_kind(url)
         if kind == "post": return analyze_instagram_post(url)
-        if kind in {"story","highlight"}: return analyze_generic_ydl(url, "instagram", kind)
+        if kind == "story": return analyze_instagram_story(url)
+        if kind == "highlight": return analyze_instagram_highlight(url)
         return analyze_generic_ydl(url, "instagram", "media")
     if platform == "youtube":
         return analyze_youtube_fastsaver(url)
@@ -1416,8 +1622,17 @@ def result_text(result: dict[str, Any]) -> str:
 
 
 
-async def download_url(url: str, dest: Path):
-    async with httpx.AsyncClient(timeout=180, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0"}) as client:
+async def download_url(url: str, dest: Path, platform: str = "generic"):
+    headers={"User-Agent":"Mozilla/5.0"}
+    cookies=None
+    if platform == "instagram":
+        headers.update({"Referer":"https://www.instagram.com/","Origin":"https://www.instagram.com"})
+        try:
+            if loader.context.is_logged_in:
+                cookies=loader.save_session()
+        except Exception:
+            cookies=None
+    async with httpx.AsyncClient(timeout=180, follow_redirects=True, headers=headers, cookies=cookies) as client:
         async with client.stream("GET", url) as r:
             r.raise_for_status()
             with dest.open("wb") as f:
@@ -1511,10 +1726,36 @@ def download_spotify_sync(source_url: str, outdir: Path) -> list[Path]:
 
 async def prepare_media(job: dict[str,Any], idx: int, quality: str, mode: str, tmp: Path) -> tuple[Path,str,str]:
     result=job["result"]; item=result["media"][idx]; platform=result.get("platform","generic")
+
+    async def instagram_direct(url_key:str,dest:Path) -> None:
+        media_url=item.get(url_key)
+        if not media_url:
+            raise RuntimeError("لینک مستقیم Instagram پیدا نشد.")
+        try:
+            await download_url(media_url,dest,"instagram")
+            return
+        except Exception as first_exc:
+            # Instagram CDN URLs are signed and can expire while a job is waiting in queue.
+            # Refresh metadata once and retry with a fresh URL.
+            log.info("Instagram CDN URL failed; refreshing metadata once: %s", first_exc)
+            fresh=await analyze(job["source_url"])
+            fresh_media=fresh.get("media") or []
+            if idx >= len(fresh_media) or not fresh_media[idx].get(url_key):
+                raise first_exc
+            job["result"]=fresh
+            await download_url(fresh_media[idx][url_key],dest,"instagram")
+
     if item["type"]=="image":
         if not item.get("display_url"): raise RuntimeError("URL عکس پیدا نشد.")
-        path=tmp/f"image_{idx+1}.jpg"; await download_url(item["display_url"],path); return path,"image","HQ"
+        path=tmp/f"image_{idx+1}.jpg"
+        if platform=="instagram": await instagram_direct("display_url",path)
+        else: await download_url(item["display_url"],path,platform)
+        return path,"image","HQ"
     playlist_index=int(item.get("playlist_index",idx+1))
+    if platform=="instagram" and item["type"]=="video" and item.get("video_url"):
+        path=tmp/f"instagram_{idx+1}.mp4"
+        await instagram_direct("video_url",path)
+        return path,"video","Best"
     if mode=="audio" or item["type"]=="audio":
         path=await asyncio.to_thread(download_audio_sync,job["source_url"],playlist_index,quality,tmp,platform)
         return path,"audio",f"MP3 {quality}k"
@@ -2166,6 +2407,7 @@ async def admin_system(chat_id:int):
     text=(f"🩺 <b>System Status</b>\n\n✅ Bot: Online\n⏱ Uptime: <b>{up//3600}h {(up%3600)//60}m</b>\n"
           f"💽 /tmp free: <b>{du.free/(1024**3):.2f} GB</b>\n🗃 DB: <b>{db_backend()}</b>\n"
           f"⚡ FastSaver Pool: <b>{pool['total']}</b> keys / <b>{pool['active']}</b> active\n"
+          f"📸 Instagram Session: <b>{'Loaded' if INSTAGRAM_SESSION_READY else 'Not configured'}</b>\n"
           f"📥 Queue workers: <b>{MAX_CONCURRENT_JOBS}</b> · active <b>{queue_counts()['running']}</b> · waiting <b>{queue_counts()['waiting']}</b>")
     await send_text(chat_id,text)
 
@@ -2305,6 +2547,8 @@ def friendly_error_text(platform:str, exc:Exception|str) -> str:
         detail="سرویس موقتاً شلوغه. چند ثانیه بعد دوباره تلاش کن."
     elif "fetch.error" in raw or "نتیجه" in raw or "پیدا نکرد" in raw:
         detail="این محتوا پیدا نشد یا منبعش فعلاً قابل دریافت نیست."
+    elif platform=="instagram" and ("session" in raw or "login" in raw or "checkpoint" in raw or "challenge" in raw):
+        detail="دسترسی Instagram بات نیاز به Session معتبر داره یا Session فعلی نیاز به تازه‌سازی داره."
     elif "private" in raw or "login" in raw or "cookie" in raw:
         detail="این محتوا احتمالاً خصوصی یا نیازمند ورود به حسابه."
     elif "too large" in raw or "بیشتر" in raw and "mb" in raw:

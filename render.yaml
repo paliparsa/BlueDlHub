@@ -35,6 +35,10 @@ services:
         value: "12"
       - key: SPOTIFY_ENABLED
         value: "true"
+      - key: INSTAGRAM_USERNAME
+        sync: false
+      - key: INSTAGRAM_SESSION_B64
+        sync: false
       - key: MAX_CONCURRENT_JOBS
         value: "3"
       - key: MAX_QUEUE_SIZE

@@ -1,6 +1,6 @@
 fastapi==0.103.2
 uvicorn[standard]==0.23.2
 httpx==0.28.1
-instaloader>=4.14
+instaloader==4.15.3
 yt-dlp[default]==2026.7.4
 psycopg[binary]>=3.2,<4

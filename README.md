@@ -4,7 +4,7 @@ BlueGate Downloader is a Telegram media downloader with a persistent PostgreSQL 
 
 ## Supported sources
 
-- Instagram
+- Instagram — Photo posts, carousels, Reels, Stories and Highlights
 - YouTube
 - X / Twitter
 - SoundCloud
@@ -96,6 +96,98 @@ After the bot is running, manage all additional keys from:
 ```
 
 The API pool supports automatic fallback when a key is rate-limited, exhausted, disabled or temporarily unavailable.
+
+
+## Instagram session setup
+
+Photo posts and carousels are extracted with Instaloader. Stories and Highlights require an authenticated Instagram session, and using a session is also recommended for public posts because Instagram applies stricter limits to anonymous/cloud traffic.
+
+Use a separate Instagram account for the bot rather than your primary account.
+
+### 1. Log in through Chrome
+
+On your Windows PC, sign in to the bot Instagram account in Chrome and confirm that Instagram works normally in that browser session.
+
+### 2. Install the local session tools
+
+Open PowerShell and run:
+
+```powershell
+py -m pip install --upgrade instaloader browser-cookie3
+```
+
+### 3. Export the browser login into an Instaloader session
+
+Close extra Instagram tabs first, then run:
+
+```powershell
+instaloader --load-cookies chrome --sessionfile instagram.session
+```
+
+Instaloader supports importing Instagram cookies from Chrome and saves the authenticated session file. No download target is needed; when the command finishes, `instagram.session` should be in the current folder.
+
+If Chrome cookie access fails, fully close Chrome and run the command again. Firefox can be used instead:
+
+```powershell
+instaloader --load-cookies firefox --sessionfile instagram.session
+```
+
+### 4. Convert the session to Base64
+
+From the folder containing `instagram.session`, run:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("instagram.session")) | Set-Clipboard
+```
+
+The Base64 value is now in your clipboard.
+
+### 5. Add the secrets to Render
+
+Open:
+
+```text
+Render → your bot service → Environment
+```
+
+Add:
+
+```env
+INSTAGRAM_USERNAME=your_bot_instagram_username
+INSTAGRAM_SESSION_B64=PASTE_THE_BASE64_VALUE_HERE
+```
+
+Do not upload `instagram.session` to GitHub and do not share `INSTAGRAM_SESSION_B64`.
+
+Save the variables and redeploy the service.
+
+### 6. Verify
+
+After deploy, open the Telegram admin panel:
+
+```text
+Admin Mode → System
+```
+
+It should show:
+
+```text
+Instagram Session: Loaded
+```
+
+Then test, in this order:
+
+1. A public photo post
+2. A carousel containing photos/videos
+3. A Reel
+4. A current Story link
+5. A Highlight link
+
+The Instagram path uses direct signed Instagram CDN URLs after metadata extraction. If a signed URL expires while waiting in the queue, the bot refreshes the Instagram metadata once and retries automatically.
+
+### Session maintenance
+
+If Instagram logs the account out, requests can begin returning login/checkpoint/challenge errors. Log in to the same bot account in the browser, complete any Instagram confirmation, create a fresh `instagram.session`, Base64 it again, replace `INSTAGRAM_SESSION_B64` in Render, and redeploy.
 
 ## Neon setup
 
