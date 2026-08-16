@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: bluegate-multi-downloader-v4-4
+    name: bluegate-downloader
     runtime: docker
     plan: free
     healthCheckPath: /health
@@ -49,3 +49,5 @@ services:
         value: "90"
       - key: FASTSAVER_HEALTH_INTERVAL
         value: "600"
+      - key: BATCH_MAX_LINKS
+        value: "10"

@@ -34,7 +34,7 @@ logging.basicConfig(level=logging.INFO)
 # Avoid httpx logging full Telegram Bot API URLs (which contain the bot token).
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-log = logging.getLogger("bluegate-downloader-v4.4")
+log = logging.getLogger("bluegate-downloader")
 STARTED_AT = int(time.time())
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -69,6 +69,7 @@ USER_JOB_COOLDOWN = max(0, int(os.getenv("USER_JOB_COOLDOWN", "3")))
 QUEUE_MAX_RETRIES = max(0, int(os.getenv("QUEUE_MAX_RETRIES", "2")))
 SMART_CACHE_TTL_DAYS = max(1, int(os.getenv("SMART_CACHE_TTL_DAYS", "90")))
 FASTSAVER_HEALTH_INTERVAL = max(60, int(os.getenv("FASTSAVER_HEALTH_INTERVAL", "600")))
+BATCH_MAX_LINKS = max(2, min(25, int(os.getenv("BATCH_MAX_LINKS", "10"))))
 
 def prepare_runtime_cookies() -> None:
     """Materialize base64-encoded Netscape cookies from Render secrets."""
@@ -90,7 +91,7 @@ if not BOT_TOKEN:
     log.warning("BOT_TOKEN is not set")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-app = FastAPI(title="BlueGate Multi Downloader V4.4 Production Queue")
+app = FastAPI(title="BlueGate Downloader")
 loader = instaloader.Instaloader(download_pictures=False, download_videos=False, save_metadata=False, quiet=True)
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
@@ -265,7 +266,7 @@ def init_db():
             cols = {r[1] for r in conn.execute("PRAGMA table_info(downloads)").fetchall()}
             if "platform" not in cols:
                 conn.execute("ALTER TABLE downloads ADD COLUMN platform TEXT DEFAULT 'unknown'")
-        # V4.4 production queue / dedup / smart-cache tables. These statements are compatible with SQLite + Postgres.
+        # Queue, deduplication, and cache tables.
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS queue_jobs (
             queue_id TEXT PRIMARY KEY, source_job_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -285,6 +286,23 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS runtime_metrics (
             key TEXT PRIMARY KEY, value BIGINT NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS user_preferences (
+            user_id BIGINT PRIMARY KEY, language TEXT NOT NULL DEFAULT 'fa',
+            quick_mode INTEGER NOT NULL DEFAULT 0, youtube_default TEXT NOT NULL DEFAULT 'ask',
+            spotify_auto INTEGER NOT NULL DEFAULT 1, instagram_auto INTEGER NOT NULL DEFAULT 0,
+            soundcloud_auto INTEGER NOT NULL DEFAULT 0, notifications TEXT NOT NULL DEFAULT 'normal',
+            updated_at BIGINT NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS favorites (
+            fav_id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, platform TEXT, title TEXT,
+            media_type TEXT, quality TEXT, file_id TEXT NOT NULL, source_url TEXT, created_at BIGINT NOT NULL,
+            UNIQUE(user_id,file_id)
+        );
+        CREATE TABLE IF NOT EXISTS user_overrides (
+            user_id BIGINT PRIMARY KEY, daily_limit INTEGER NOT NULL DEFAULT -1,
+            max_active_jobs INTEGER NOT NULL DEFAULT -1, cooldown INTEGER NOT NULL DEFAULT -1,
+            updated_at BIGINT NOT NULL DEFAULT 0
         );
         """)
         # A crashed Render deploy must not leave jobs permanently in running state.
@@ -425,6 +443,115 @@ def get_user_state(user_id:int):
 def clear_user_state(user_id:int) -> None:
     with db() as conn: conn.execute("DELETE FROM user_state WHERE user_id=?",(user_id,))
 
+
+PREF_COLUMNS = {"language","quick_mode","youtube_default","spotify_auto","instagram_auto","soundcloud_auto","notifications"}
+DEFAULT_PREFS = {
+    "language":"fa", "quick_mode":0, "youtube_default":"ask",
+    "spotify_auto":1, "instagram_auto":0, "soundcloud_auto":0, "notifications":"normal"
+}
+
+def get_user_prefs(user_id:int) -> dict[str,Any]:
+    with db() as conn:
+        row=conn.execute("SELECT * FROM user_preferences WHERE user_id=?",(user_id,)).fetchone()
+    out=dict(DEFAULT_PREFS)
+    if row:
+        for k in PREF_COLUMNS:
+            try:
+                if row[k] is not None: out[k]=row[k]
+            except Exception:
+                pass
+    for k in ("quick_mode","spotify_auto","instagram_auto","soundcloud_auto"):
+        out[k]=int(out.get(k) or 0)
+    return out
+
+def set_user_pref(user_id:int,key:str,value:Any) -> None:
+    if key not in PREF_COLUMNS: raise ValueError("unknown preference")
+    prefs=get_user_prefs(user_id); prefs[key]=value
+    with db() as conn:
+        conn.execute("""INSERT INTO user_preferences(user_id,language,quick_mode,youtube_default,spotify_auto,instagram_auto,soundcloud_auto,notifications,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+                        language=excluded.language,quick_mode=excluded.quick_mode,youtube_default=excluded.youtube_default,
+                        spotify_auto=excluded.spotify_auto,instagram_auto=excluded.instagram_auto,soundcloud_auto=excluded.soundcloud_auto,
+                        notifications=excluded.notifications,updated_at=excluded.updated_at""",
+                     (user_id,prefs["language"],int(prefs["quick_mode"]),prefs["youtube_default"],int(prefs["spotify_auto"]),int(prefs["instagram_auto"]),int(prefs["soundcloud_auto"]),prefs["notifications"],now_ts()))
+
+def user_lang(user_id:int) -> str:
+    return "en" if get_user_prefs(user_id).get("language")=="en" else "fa"
+
+def ux(user_id:int, fa:str, en:str) -> str:
+    return en if user_lang(user_id)=="en" else fa
+
+def get_user_override(user_id:int) -> dict[str,int]:
+    with db() as conn: row=conn.execute("SELECT * FROM user_overrides WHERE user_id=?",(user_id,)).fetchone()
+    if not row: return {"daily_limit":-1,"max_active_jobs":-1,"cooldown":-1}
+    return {k:int(row[k] if row[k] is not None else -1) for k in ("daily_limit","max_active_jobs","cooldown")}
+
+def set_user_override(user_id:int, field:str, value:int) -> None:
+    if field not in {"daily_limit","max_active_jobs","cooldown"}: raise ValueError("unknown override")
+    cur=get_user_override(user_id); cur[field]=int(value)
+    with db() as conn:
+        conn.execute("""INSERT INTO user_overrides(user_id,daily_limit,max_active_jobs,cooldown,updated_at) VALUES(?,?,?,?,?)
+                        ON CONFLICT(user_id) DO UPDATE SET daily_limit=excluded.daily_limit,max_active_jobs=excluded.max_active_jobs,cooldown=excluded.cooldown,updated_at=excluded.updated_at""",
+                     (user_id,cur["daily_limit"],cur["max_active_jobs"],cur["cooldown"],now_ts()))
+
+def reset_user_overrides(user_id:int) -> None:
+    with db() as conn: conn.execute("DELETE FROM user_overrides WHERE user_id=?",(user_id,))
+
+def effective_daily_limit(user_id:int) -> int:
+    v=get_user_override(user_id)["daily_limit"]
+    return daily_limit() if v < 0 else max(0,v)
+
+def effective_max_active(user_id:int) -> int:
+    v=get_user_override(user_id)["max_active_jobs"]
+    return MAX_ACTIVE_JOBS_PER_USER if v < 0 else max(1,v)
+
+def effective_cooldown(user_id:int) -> int:
+    v=get_user_override(user_id)["cooldown"]
+    return USER_JOB_COOLDOWN if v < 0 else max(0,v)
+
+def add_favorite(user_id:int, row:Any) -> str:
+    fid=secrets.token_urlsafe(7).replace("-","").replace("_","")[:9]
+    with db() as conn:
+        existing=conn.execute("SELECT fav_id FROM favorites WHERE user_id=? AND file_id=?",(user_id,row["file_id"])).fetchone()
+        if existing: return str(existing["fav_id"])
+        conn.execute("INSERT INTO favorites(fav_id,user_id,platform,title,media_type,quality,file_id,source_url,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (fid,user_id,row["platform"],row["title"],row["media_type"],row["quality"],row["file_id"],row["source_url"],now_ts()))
+    return fid
+
+def list_favorites(user_id:int, limit:int=12):
+    with db() as conn: return conn.execute("SELECT * FROM favorites WHERE user_id=? ORDER BY created_at DESC LIMIT ?",(user_id,limit)).fetchall()
+
+def get_favorite(user_id:int,fav_id:str):
+    with db() as conn: return conn.execute("SELECT * FROM favorites WHERE user_id=? AND fav_id=?",(user_id,fav_id)).fetchone()
+
+def delete_favorite(user_id:int,fav_id:str) -> None:
+    with db() as conn: conn.execute("DELETE FROM favorites WHERE user_id=? AND fav_id=?",(user_id,fav_id))
+
+def favorite_count(user_id:int) -> int:
+    with db() as conn: return int(conn.execute("SELECT COUNT(*) c FROM favorites WHERE user_id=?",(user_id,)).fetchone()["c"] or 0)
+
+def search_history(user_id:int, query:str, limit:int=10):
+    q=f"%{query.strip()}%"
+    with db() as conn:
+        return conn.execute("SELECT * FROM recent_downloads WHERE user_id=? AND (lower(title) LIKE lower(?) OR lower(source_url) LIKE lower(?)) ORDER BY id DESC LIMIT ?",(user_id,q,q,limit)).fetchall()
+
+def latest_recent(user_id:int):
+    with db() as conn: return conn.execute("SELECT * FROM recent_downloads WHERE user_id=? ORDER BY id DESC LIMIT 1",(user_id,)).fetchone()
+
+def recent_for_job(user_id:int,job_id:str):
+    job=load_job(job_id)
+    if job:
+        with db() as conn:
+            row=conn.execute("SELECT * FROM recent_downloads WHERE user_id=? AND source_url=? ORDER BY id DESC LIMIT 1",(user_id,job["source_url"])).fetchone()
+            if row: return row
+    return latest_recent(user_id)
+
+def extract_urls(text:str) -> list[str]:
+    out=[]
+    for raw in URL_RE.findall(text or ""):
+        u=raw.rstrip(".,);]}>\"'")
+        if u not in out: out.append(u)
+    return out
 
 def get_admin_state(admin_id:int):
     with db() as conn:
@@ -1029,8 +1156,17 @@ async def fastsaver_audio_file_id(video_id: str, cache_key: str, title: str, pla
     return str(file_id)
 
 
+def apply_notification_pref(chat_id:int, data:dict[str,Any]) -> dict[str,Any]:
+    try:
+        if int(chat_id) > 0 and get_user_prefs(int(chat_id)).get("notifications")=="silent":
+            data["disable_notification"]="true"
+    except Exception:
+        pass
+    return data
+
 async def send_audio_file_id(chat_id: int, file_id: str, caption: str):
-    return await tg("sendAudio", {"chat_id":str(chat_id), "audio":file_id, "caption":caption, "parse_mode":"HTML"})
+    data={"chat_id":str(chat_id), "audio":file_id, "caption":caption, "parse_mode":"HTML"}
+    return await tg("sendAudio", apply_notification_pref(chat_id,data))
 
 
 
@@ -1107,7 +1243,7 @@ async def send_text(chat_id: int, text: str, reply_markup: dict | None = None):
     data = {"chat_id":str(chat_id),"text":text,"parse_mode":"HTML",
             "link_preview_options":json.dumps({"is_disabled":True})}
     if reply_markup: data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-    return await tg("sendMessage", data)
+    return await tg("sendMessage", apply_notification_pref(chat_id,data))
 
 
 async def edit_text(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None):
@@ -1201,7 +1337,7 @@ def result_text(result: dict[str, Any]) -> str:
     owner=str(result.get('owner') or '').strip()
     if owner: lines.append(f"👤 {html.escape(owner)[:100]}")
     if platform=="spotify":
-        lines += ["","🎧 <b>Music-only</b> · FastSaver","⚡ Music Search + Music Download","","آماده‌ست؛ بزن دانلود 👇"]
+        lines += ["","🎧 <b>دانلود موسیقی</b>","نسخه صوتی آماده دانلود است.","","بزن دانلود 👇"]
         return "\n".join(lines)
     counts={t:sum(1 for x in media if x.get("type")==t) for t in ("image","video","audio")}
     duration=human_duration(media[0].get("duration") if media else None)
@@ -1339,6 +1475,7 @@ async def send_file(chat_id:int,path:Path,kind:str,caption:str):
     with path.open("rb") as f:
         data={"chat_id":str(chat_id),"caption":caption,"parse_mode":"HTML"}
         if kind=="video": data["supports_streaming"]="true"
+        apply_notification_pref(chat_id,data)
         return await tg(method,data,{field:(path.name,f,mime)})
 
 
@@ -1349,18 +1486,18 @@ async def send_one(job:dict[str,Any],user_id:int,chat_id:int,idx:int,quality:str
     status={"message_id":status_message_id} if status_message_id else await send_text(chat_id,"⏳ <b>درخواست ثبت شد</b>\n▰▱▱▱ آماده‌سازی…")
     try:
         if platform=="youtube" and mode=="audio":
-            await edit_text(chat_id,status["message_id"],"🎵 <b>نسخه صوتی</b>\n▰▰▱▱ دریافت از FastSaver…")
+            await edit_text(chat_id,status["message_id"],"🎵 <b>نسخه صوتی</b>\n▰▰▱▱ در حال آماده‌سازی…")
             item=job["result"]["media"][idx]; video_id=str(item.get("id") or "")
             if not video_id: raise RuntimeError("YouTube video_id پیدا نشد.")
             bot_username=(await ensure_bot_username()).lower(); cache_key=f"youtube:{video_id}:{bot_username}"
             file_id=await fastsaver_audio_file_id(video_id,cache_key,title,"youtube")
             await edit_text(chat_id,status["message_id"],"📤 <b>فایل آماده شد</b>\n▰▰▰▱ ارسال به تلگرام…")
             await send_audio_file_id(chat_id,file_id,f"{html.escape(BRAND_NAME)} · YouTube · Audio")
-            record_download(user_id,job["job_id"],"audio","FastSaver TG file_id",0,"youtube")
+            record_download(user_id,job["job_id"],"audio","Audio",0,"youtube")
             record_recent(user_id,"youtube",title,"audio","Audio",file_id,job["source_url"])
             await edit_text(chat_id,status["message_id"],"✅ <b>انجام شد</b>\nفایل صوتی ارسال شد.",done_keyboard(job["job_id"]))
             return True
-        tmp=Path(tempfile.mkdtemp(prefix="bluegate_v44_"))
+        tmp=Path(tempfile.mkdtemp(prefix="bluegate_"))
         try:
             await edit_text(chat_id,status["message_id"],"⬇️ <b>در حال آماده‌سازی فایل</b>\n▰▰▱▱ لطفاً چند لحظه…")
             path,kind,qlabel=await prepare_media(job,idx,quality,mode,tmp)
@@ -1401,17 +1538,17 @@ async def send_spotify(job:dict[str,Any],user_id:int,chat_id:int,status_message_
         bot_username=(await ensure_bot_username()).lower(); cache_key=f"spotify:{video_id}:{bot_username}"
         cached=get_cached_file_id(cache_key)
         if cached:
-            file_id=cached; qlabel="FastSaver Music cache"
+            file_id=cached; qlabel="Audio cache"
         else:
             await edit_text(chat_id,status["message_id"],"🎧 <b>Music Download</b>\n▰▰▰▱ آماده‌سازی فایل…")
             log.info("spotify-music: Music Download (7cr) video_id=%s",video_id)
             file_id=await fastsaver_audio_file_id(video_id,cache_key,title,"spotify")
-            qlabel="Music Search 2cr + Music Download 7cr"
+            qlabel="Audio"
         await edit_text(chat_id,status["message_id"],"📤 <b>فایل آماده‌ست</b>\n▰▰▰▱ ارسال به تلگرام…")
         await send_audio_file_id(chat_id,file_id,f"{html.escape(BRAND_NAME)} · Spotify · {html.escape(title)[:120]}")
         record_download(user_id,job["job_id"],"audio",qlabel,0,"spotify")
         record_recent(user_id,"spotify",title,"audio","MP3",file_id,job["source_url"])
-        await edit_text(chat_id,status["message_id"],"✅ <b>Spotify Track ارسال شد</b>\n⚡ Music-only path",done_keyboard(job["job_id"]))
+        await edit_text(chat_id,status["message_id"],"✅ <b>آهنگ ارسال شد</b>",done_keyboard(job["job_id"]))
         return True
     except Exception as exc:
         log_error(user_id,"spotify",exc); log.exception("spotify-music failed")
@@ -1445,32 +1582,117 @@ async def send_all(job:dict[str,Any],user_id:int,chat_id:int,status_message_id:i
 
 
 def user_home_keyboard(user_id:int) -> dict:
+    en=user_lang(user_id)=="en"
     rows=[
-        [{"text":"📥 دانلود لینک","callback_data":"home|download"},{"text":"🎵 جستجوی موزیک","callback_data":"home|music"}],
-        [{"text":"🕘 دانلودهای اخیر","callback_data":"home|recent"},{"text":"📥 صف من","callback_data":"home|queue"}],
-        [{"text":"📊 حساب من","callback_data":"home|account"},{"text":"🟢 وضعیت سرویس‌ها","callback_data":"home|services"}],
-        [{"text":"❓ راهنما","callback_data":"home|help"}],
+        [{"text":"📥 Download" if en else "📥 دانلود لینک","callback_data":"home|download"},{"text":"🎵 Music Search" if en else "🎵 جستجوی موزیک","callback_data":"home|music"}],
+        [{"text":"🕘 Recent" if en else "🕘 دانلودهای اخیر","callback_data":"home|recent"},{"text":"⭐ Favorites" if en else "⭐ ذخیره‌شده‌ها","callback_data":"home|favorites"}],
+        [{"text":"🔎 History Search" if en else "🔎 جستجوی سابقه","callback_data":"home|history"},{"text":"📊 My Profile" if en else "📊 پروفایل من","callback_data":"home|account"}],
+        [{"text":"⚙️ Settings" if en else "⚙️ تنظیمات دانلود","callback_data":"home|settings"},{"text":"📥 My Queue" if en else "📥 صف من","callback_data":"home|queue"}],
+        [{"text":"📚 Batch Links" if en else "📚 دانلود گروهی","callback_data":"home|batch"},{"text":"🟢 Services" if en else "🟢 وضعیت سرویس‌ها","callback_data":"home|services"}],
+        [{"text":"❓ Help" if en else "❓ راهنما","callback_data":"home|help"}],
     ]
     if SUPPORT_USERNAME:
-        rows.append([{"text":"🆘 پشتیبانی","url":f"https://t.me/{SUPPORT_USERNAME}"}])
+        rows.append([{"text":"🆘 Support" if en else "🆘 پشتیبانی","url":f"https://t.me/{SUPPORT_USERNAME}"}])
     if user_id in ADMIN_IDS:
-        rows.append([{"text":"🛡 ورود به حالت ادمین","callback_data":"mode|admin"}])
+        rows.append([{"text":"🛡 Admin Mode" if en else "🛡 ورود به حالت ادمین","callback_data":"mode|admin"}])
     return {"inline_keyboard":rows}
 
 
-
 async def send_user_home(chat_id:int,user_id:int,first_name:str=""):
-    st=user_download_stats(user_id); lim=daily_limit(); remaining="نامحدود" if not lim else max(0,lim-st["today"])
+    st=user_download_stats(user_id); lim=effective_daily_limit(user_id); remaining="∞" if not lim else max(0,lim-st["today"]); prefs=get_user_prefs(user_id)
     service_line=" · ".join(f"{PLATFORM_ICONS[p]}{'🟢' if service_enabled(p) else '🔴'}" for p in ("instagram","youtube","twitter","soundcloud","spotify"))
-    intro=("\n\n<b>سه قدم:</b> لینک رو بفرست ← فرمت/کیفیت رو انتخاب کن ← فایل رو بگیر." if st["total"]==0 else "")
-    text=(f"👋 {html.escape(first_name) if first_name else 'سلام'}\n"
-          f"<b>{html.escape(BRAND_NAME)}</b>\n\n"
-          f"{service_line}\n\n"
-          f"📥 امروز: <b>{st['today']}</b> · 🎟 باقی‌مانده: <b>{remaining}</b>{intro}\n\n"
-          "لینک رو مستقیم بفرست یا یکی از گزینه‌ها رو انتخاب کن 👇")
+    if user_lang(user_id)=="en":
+        intro="\n\n<b>Three steps:</b> send a link → choose format → get the file." if st["total"]==0 else ""
+        quick="ON" if prefs["quick_mode"] else "OFF"
+        text=(f"👋 {html.escape(first_name) if first_name else 'Hi'}\n<b>{html.escape(BRAND_NAME)}</b>\n\n{service_line}\n\n"
+              f"📥 Today: <b>{st['today']}</b> · 🎟 Remaining: <b>{remaining}</b> · ⚡ Quick: <b>{quick}</b>{intro}\n\n"
+              "Send a link directly or choose an option 👇")
+    else:
+        intro="\n\n<b>سه قدم:</b> لینک رو بفرست ← فرمت/کیفیت رو انتخاب کن ← فایل رو بگیر." if st["total"]==0 else ""
+        quick="روشن" if prefs["quick_mode"] else "خاموش"
+        text=(f"👋 {html.escape(first_name) if first_name else 'سلام'}\n<b>{html.escape(BRAND_NAME)}</b>\n\n{service_line}\n\n"
+              f"📥 امروز: <b>{st['today']}</b> · 🎟 باقی‌مانده: <b>{remaining}</b> · ⚡ سریع: <b>{quick}</b>{intro}\n\n"
+              "لینک رو مستقیم بفرست یا یکی از گزینه‌ها رو انتخاب کن 👇")
     await send_text(chat_id,text,user_home_keyboard(user_id))
 
 
+def settings_keyboard(user_id:int) -> dict:
+    p=get_user_prefs(user_id); en=p["language"]=="en"
+    yt={"ask":"Ask","720":"720p","best":"Best","audio":"Audio"}.get(str(p["youtube_default"]),"Ask") if en else {"ask":"هر بار بپرس","720":"720p","best":"بهترین","audio":"فقط صدا"}.get(str(p["youtube_default"]),"هر بار بپرس")
+    return {"inline_keyboard":[
+        [{"text":f"⚡ Quick Mode: {'ON' if p['quick_mode'] else 'OFF'}","callback_data":"pref|quick"}],
+        [{"text":f"▶️ YouTube: {yt}","callback_data":"pref|youtube"}],
+        [{"text":f"🟢 Spotify Auto: {'ON' if p['spotify_auto'] else 'OFF'}","callback_data":"pref|spotify"}],
+        [{"text":f"📸 Instagram Auto: {'ON' if p['instagram_auto'] else 'OFF'}","callback_data":"pref|instagram"}],
+        [{"text":f"☁️ SoundCloud Auto: {'ON' if p['soundcloud_auto'] else 'OFF'}","callback_data":"pref|soundcloud"}],
+        [{"text":f"🔔 {'Silent' if p['notifications']=='silent' else 'Normal'}","callback_data":"pref|notify"}],
+        [{"text":f"🌐 {'English' if en else 'فارسی'}","callback_data":"pref|language"}],
+        [{"text":"🏠 Home" if en else "🏠 خانه","callback_data":"home|home"}]
+    ]}
+
+def settings_text(user_id:int) -> str:
+    if user_lang(user_id)=="en":
+        return ("⚙️ <b>Download Settings</b>\n\nQuick Mode skips selection screens when a default is available. "
+                "Spotify/Instagram/SoundCloud Auto options are used only when Quick Mode is ON.\n\nYour choices are saved to your account.")
+    return ("⚙️ <b>تنظیمات دانلود</b>\n\nQuick Mode وقتی تنظیم پیش‌فرض داشته باشی صفحه انتخاب رو رد می‌کنه. "
+            "گزینه‌های Auto برای Spotify/Instagram/SoundCloud وقتی Quick Mode روشن باشه اعمال می‌شن.\n\nتنظیمات روی حسابت ذخیره می‌شن.")
+
+async def send_settings_page(chat_id:int,user_id:int,message_id:int|None=None):
+    text=settings_text(user_id); kb=settings_keyboard(user_id)
+    if message_id:
+        try: return await edit_text(chat_id,message_id,text,kb)
+        except Exception: pass
+    await send_text(chat_id,text,kb)
+
+async def send_favorites_menu(chat_id:int,user_id:int):
+    rows=list_favorites(user_id,12); en=user_lang(user_id)=="en"
+    if not rows:
+        return await send_text(chat_id,"⭐ <b>Favorites</b>\n\nNothing saved yet." if en else "⭐ <b>ذخیره‌شده‌ها</b>\n\nهنوز چیزی ذخیره نکردی.",nav_home_keyboard())
+    kb=[]
+    for r in rows:
+        title=str(r["title"] or "Media").replace("\n"," ")[:32]
+        kb.append([{"text":f"{PLATFORM_ICONS.get(r['platform'],'📦')} {title}","callback_data":f"favsend|{r['fav_id']}"},{"text":"🗑","callback_data":f"favdel|{r['fav_id']}"}])
+    kb.append([{"text":"🏠 Home" if en else "🏠 خانه","callback_data":"home|home"}])
+    await send_text(chat_id,"⭐ <b>Favorites</b>" if en else "⭐ <b>ذخیره‌شده‌های من</b>",{"inline_keyboard":kb})
+
+async def send_favorite_file(chat_id:int,user_id:int,fav_id:str):
+    r=get_favorite(user_id,fav_id)
+    if not r: return await send_text(chat_id,ux(user_id,"⌛️ این فایل دیگه موجود نیست.","⌛️ This item is no longer available."),nav_home_keyboard())
+    data={"chat_id":str(chat_id),"caption":f"{html.escape(BRAND_NAME)} · ⭐","parse_mode":"HTML"}; apply_notification_pref(chat_id,data)
+    if r["media_type"]=="image": data["photo"]=r["file_id"]; await tg("sendPhoto",data)
+    elif r["media_type"]=="video": data["video"]=r["file_id"]; data["supports_streaming"]="true"; await tg("sendVideo",data)
+    else: data["audio"]=r["file_id"]; await tg("sendAudio",data)
+    record_download(user_id,"favorite","cached",str(r["quality"] or "cached"),0,str(r["platform"] or "generic"))
+
+async def send_history_results(chat_id:int,user_id:int,query:str):
+    rows=search_history(user_id,query,10); en=user_lang(user_id)=="en"
+    if not rows: return await send_text(chat_id,("🔎 No matches in your history." if en else "🔎 چیزی توی سابقه‌ات پیدا نشد."),nav_home_keyboard())
+    kb=[]
+    for r in rows:
+        title=str(r["title"] or "Media").replace("\n"," ")[:34]
+        kb.append([{"text":f"{PLATFORM_ICONS.get(r['platform'],'📦')} {title}","callback_data":f"recent|{r['id']}"},{"text":"⭐","callback_data":f"favadd|{r['id']}"}])
+    kb.append([{"text":"🔎 New Search" if en else "🔎 جستجوی جدید","callback_data":"home|history"},{"text":"🏠 Home" if en else "🏠 خانه","callback_data":"home|home"}])
+    await send_text(chat_id,(f"🔎 <b>History: {html.escape(query)[:80]}</b>" if en else f"🔎 <b>نتایج سابقه برای: {html.escape(query)[:80]}</b>"),{"inline_keyboard":kb})
+
+def quick_action_for_result(user_id:int,result:dict[str,Any]) -> tuple[str,dict[str,Any]]|None:
+    p=get_user_prefs(user_id)
+    if not p["quick_mode"]: return None
+    platform=result.get("platform"); media=result.get("media") or []
+    if platform=="spotify" and p["spotify_auto"]: return ("spotify",{})
+    if platform=="instagram" and p["instagram_auto"] and media:
+        return ("all",{}) if len(media)>1 else ("one",{"idx":0,"quality":"b","mode":"video"})
+    if platform=="soundcloud" and p["soundcloud_auto"] and media:
+        return ("one",{"idx":0,"quality":"128","mode":"audio"})
+    if platform=="youtube" and media:
+        mode=str(p["youtube_default"] or "ask")
+        if mode=="ask": return None
+        if mode=="audio": return ("one",{"idx":0,"quality":"128","mode":"audio"})
+        qs=[int(x) for x in (media[0].get("qualities") or []) if str(x).isdigit()]
+        if mode=="720":
+            candidates=[q for q in qs if q<=720]; q=str(max(candidates) if candidates else (min(qs) if qs else "b"))
+        else: q=str(max(qs) if qs else "b")
+        return ("one",{"idx":0,"quality":q,"mode":"video"})
+    return None
 
 def admin_keyboard() -> dict:
     return {"inline_keyboard":[
@@ -1549,7 +1771,7 @@ async def send_admin_panel(chat_id:int):
         banned=conn.execute("SELECT COUNT(*) c FROM bans").fetchone()["c"]
         errors24=conn.execute("SELECT COUNT(*) c FROM error_logs WHERE created_at>=?",(now_ts()-86400,)).fetchone()["c"]
     qc=queue_counts(); cs=cache_stats()
-    lines=["🛡 <b>BlueGate Admin · V4.4</b>","",f"👥 کاربران: <b>{s['users']}</b> · 🚫 بن: <b>{banned}</b>",f"🟢 فعال ۲۴h: <b>{s['active24']}</b>",
+    lines=["🛡 <b>BlueGate Admin</b>","",f"👥 کاربران: <b>{s['users']}</b> · 🚫 بن: <b>{banned}</b>",f"🟢 فعال ۲۴h: <b>{s['active24']}</b>",
            f"📥 دانلود کل: <b>{s['downloads']}</b> · امروز: <b>{s['downloads24']}</b>",f"❌ خطای ۲۴h: <b>{errors24}</b>",f"💾 حجم: <b>{gb:.2f} GB</b>",
            f"🚦 سقف روزانه: <b>{daily_limit() or 'نامحدود'}</b>",f"🛠 Maintenance: <b>{'ON' if bool_setting('maintenance',False) else 'OFF'}</b>",
            f"⚡ API Pool: <b>{pool['total']}</b> · Active <b>{pool['active']}</b> · Limited <b>{pool['rate_limited']}</b>",
@@ -1560,9 +1782,31 @@ async def send_admin_panel(chat_id:int):
 
 
 async def admin_users(chat_id:int):
-    with db() as conn: rows=conn.execute("SELECT user_id,username,first_name,last_seen FROM users ORDER BY last_seen DESC LIMIT 20").fetchall()
-    lines=["👥 <b>۲۰ کاربر اخیر</b>",""]+[f"• @{html.escape(r['username']) if r['username'] else html.escape(r['first_name'] or '-') } · <code>{r['user_id']}</code>" for r in rows]
-    lines += ["","برای مدیریت یک نفر، Ban/Unban رو بزن و ID یا username رو بفرست."]; await send_text(chat_id,"\n".join(lines))
+    with db() as conn: rows=conn.execute("SELECT user_id,username,first_name,last_seen FROM users ORDER BY last_seen DESC LIMIT 12").fetchall()
+    kb=[]
+    for r in rows:
+        name=("@"+r["username"]) if r["username"] else (r["first_name"] or str(r["user_id"]))
+        kb.append([{"text":f"👤 {name[:35]}","callback_data":f"userdetail|{r['user_id']}"}])
+    kb.append([{"text":"🔎 جستجوی کاربر","callback_data":"adm|userfind"},{"text":"⬅️ پنل","callback_data":"adm|stats"}])
+    await send_text(chat_id,"👥 <b>کاربران اخیر</b>\nروی کاربر بزن تا پروفایل مدیریتی باز بشه.",{"inline_keyboard":kb})
+
+async def send_admin_user_detail(chat_id:int,uid:int):
+    with db() as conn: row=conn.execute("SELECT * FROM users WHERE user_id=?",(uid,)).fetchone()
+    if not row: return await send_text(chat_id,"❌ کاربر پیدا نشد.")
+    st=user_download_stats(uid); ov=get_user_override(uid); prefs=get_user_prefs(uid); banned=is_banned(uid); lim=effective_daily_limit(uid)
+    text=(f"👤 <b>{html.escape(row['first_name'] or '')}</b> @{html.escape(row['username'] or '-')}\nID: <code>{uid}</code>\n\n"
+          f"وضعیت: <b>{'BANNED' if banned else 'ACTIVE'}</b>\n📥 امروز: <b>{st['today']}</b> / <b>{lim or '∞'}</b> · کل: <b>{st['total']}</b>\n"
+          f"⭐ Favorites: <b>{favorite_count(uid)}</b> · Queue: <b>{active_user_queue_count(uid)}</b>\n"
+          f"⚡ Quick: <b>{'ON' if prefs['quick_mode'] else 'OFF'}</b> · 🌐 {html.escape(str(prefs['language']))}\n\n"
+          f"Overrides → Daily: <b>{ov['daily_limit']}</b> · Active: <b>{ov['max_active_jobs']}</b> · Cooldown: <b>{ov['cooldown']}</b>\n"
+          "<i>-1 یعنی استفاده از تنظیم عمومی.</i>")
+    kb={"inline_keyboard":[
+        [{"text":"✅ Unban" if banned else "🚫 Ban","callback_data":f"adminban|{uid}|{0 if banned else 1}"},{"text":"📨 پیام","callback_data":f"usermsg|{uid}"}],
+        [{"text":"🎟 Daily Limit","callback_data":f"userov|{uid}|daily_limit"},{"text":"📥 Active Jobs","callback_data":f"userov|{uid}|max_active_jobs"}],
+        [{"text":"⏱ Cooldown","callback_data":f"userov|{uid}|cooldown"},{"text":"♻️ Reset Overrides","callback_data":f"userreset|{uid}"}],
+        [{"text":"⬅️ کاربران","callback_data":"adm|users"}]
+    ]}
+    await send_text(chat_id,text,kb)
 
 
 async def admin_errors(chat_id:int):
@@ -1578,7 +1822,7 @@ async def admin_system(chat_id:int):
     text=(f"🩺 <b>System Status</b>\n\n✅ Bot: Online\n⏱ Uptime: <b>{up//3600}h {(up%3600)//60}m</b>\n"
           f"💽 /tmp free: <b>{du.free/(1024**3):.2f} GB</b>\n🗃 DB: <b>{db_backend()}</b>\n"
           f"⚡ FastSaver Pool: <b>{pool['total']}</b> keys / <b>{pool['active']}</b> active\n"
-          f"📥 Queue workers: <b>{MAX_CONCURRENT_JOBS}</b> · active <b>{queue_counts()['running']}</b> · waiting <b>{queue_counts()['waiting']}</b>\n📦 Version: <b>4.4.0</b>")
+          f"📥 Queue workers: <b>{MAX_CONCURRENT_JOBS}</b> · active <b>{queue_counts()['running']}</b> · waiting <b>{queue_counts()['waiting']}</b>")
     await send_text(chat_id,text)
 
 
@@ -1611,9 +1855,18 @@ async def handle_admin_input(user_id:int,chat_id:int,text:str,state:tuple[str,st
         with db() as conn:
             row=conn.execute("SELECT * FROM users WHERE user_id=?",(int(q),)).fetchone() if q.lstrip('-').isdigit() else conn.execute("SELECT * FROM users WHERE lower(username)=lower(?)",(q,)).fetchone()
         if not row: await send_text(chat_id,"❌ کاربر پیدا نشد."); return True
-        uid=row['user_id']; banned=is_banned(uid); cnt=user_downloads_today(uid)
-        kb={"inline_keyboard":[[{"text":"✅ Unban" if banned else "🚫 Ban","callback_data":f"adminban|{uid}|{0 if banned else 1}"}]]}
-        await send_text(chat_id,f"👤 <b>{html.escape(row['first_name'] or '')}</b> @{html.escape(row['username'] or '-')}\nID: <code>{uid}</code>\nدانلود ۲۴h: <b>{cnt}</b>\nوضعیت: <b>{'BANNED' if banned else 'ACTIVE'}</b>",kb); return True
+        uid=row['user_id']; await send_admin_user_detail(chat_id,int(uid)); return True
+    if action in {"user_daily_limit","user_max_active_jobs","user_cooldown"}:
+        try:
+            uid=int(payload); n=int(text.strip()); field=action.replace("user_","")
+            if n < -1: raise ValueError()
+            set_user_override(uid,field,n); await send_text(chat_id,"✅ تنظیم اختصاصی ذخیره شد."); await send_admin_user_detail(chat_id,uid)
+        except Exception: await send_text(chat_id,"❌ عدد معتبر بفرست. -1 یعنی تنظیم عمومی؛ برای Daily عدد 0 یعنی نامحدود.")
+        return True
+    if action=="user_message":
+        try: await send_text(int(payload),text); await send_text(chat_id,"✅ پیام ارسال شد.")
+        except Exception as exc: await send_text(chat_id,"❌ ارسال نشد: <code>"+html.escape(str(exc))[:300]+"</code>")
+        return True
     if action=="limit":
         try: n=max(0,int(text.strip())); set_setting('daily_limit',str(n)); await send_text(chat_id,f"✅ سقف روزانه شد <b>{n or 'نامحدود'}</b>.")
         except: await send_text(chat_id,"❌ فقط عدد بفرست؛ 0 یعنی نامحدود.")
@@ -1628,10 +1881,10 @@ async def handle_admin_input(user_id:int,chat_id:int,text:str,state:tuple[str,st
 HELP_TEXT=(
     "لینک یکی از این سرویس‌ها رو بفرست 👇\n\n"
     "📸 <b>Instagram</b> — Post / Reel / Carousel / Story / Highlight\n"
-    "▶️ <b>YouTube</b> — Video / Shorts + Audio (FastSaver API)\n"
+    "▶️ <b>YouTube</b> — Video / Shorts / Audio\n"
     "𝕏 <b>X / Twitter</b> — Video / GIF / media\n"
     "☁️ <b>SoundCloud</b> — Track / set + MP3\n"
-    "🟢 <b>Spotify</b> — Track → FastSaver Music Search (2cr) + Music Download (7cr)\n\n"
+    "🟢 <b>Spotify</b> — دانلود Track صوتی\n\n"
     f"📦 حداکثر آیتم Playlist در هر درخواست: <b>{MAX_PLAYLIST_ITEMS}</b>\n"
     "فقط محتوایی رو دانلود کن که اجازه ذخیره/استفاده ازش رو داری."
 )
@@ -1644,7 +1897,7 @@ def nav_home_keyboard() -> dict:
 
 def done_keyboard(job_id:str) -> dict:
     return {"inline_keyboard":[
-        [{"text":"🔁 کیفیت/فرمت دیگر","callback_data":f"again|{job_id}"}],
+        [{"text":"⭐ ذخیره آخرین فایل","callback_data":f"favlast|{job_id}"},{"text":"🔁 کیفیت/فرمت دیگر","callback_data":f"again|{job_id}"}],
         [{"text":"🕘 دانلودهای اخیر","callback_data":"home|recent"},{"text":"🏠 خانه","callback_data":"home|home"}],
     ]}
 
@@ -1667,7 +1920,7 @@ def friendly_error_text(platform:str, exc:Exception|str) -> str:
     if "هیچ fastsaver api" in raw or "همه api" in raw:
         detail="سرویس دانلود موزیک/YouTube موقتاً ظرفیت نداره. چند لحظه بعد دوباره امتحان کن."
     elif "429" in raw or "rate limit" in raw:
-        detail="سرویس موقتاً شلوغه. بات می‌تونه با API بعدی تلاش کنه؛ چند ثانیه بعد Retry بزن."
+        detail="سرویس موقتاً شلوغه. چند ثانیه بعد دوباره تلاش کن."
     elif "fetch.error" in raw or "نتیجه" in raw or "پیدا نکرد" in raw:
         detail="این محتوا پیدا نشد یا منبعش فعلاً قابل دریافت نیست."
     elif "private" in raw or "login" in raw or "cookie" in raw:
@@ -1709,7 +1962,7 @@ async def show_result_card(chat_id:int,result:dict[str,Any],job_id:str,status_me
     if thumb and result.get("platform")!="music":
         try:
             data={"chat_id":str(chat_id),"photo":thumb,"caption":text,"parse_mode":"HTML","reply_markup":json.dumps(kb,ensure_ascii=False)}
-            await tg("sendPhoto",data)
+            apply_notification_pref(chat_id,data); await tg("sendPhoto",data)
             if status_message_id: await delete_message(chat_id,status_message_id)
             return
         except Exception as exc:
@@ -1721,15 +1974,23 @@ async def show_result_card(chat_id:int,result:dict[str,Any],job_id:str,status_me
 
 
 async def send_account_page(chat_id:int,user_id:int):
-    st=user_download_stats(user_id); lim=daily_limit(); rem="نامحدود" if not lim else max(0,lim-st["today"])
-    top=PLATFORM_LABELS.get(st["top"],st["top"])
-    await send_text(chat_id,
-        f"📊 <b>حساب من</b>\n\n📥 امروز: <b>{st['today']}</b> / <b>{lim or '∞'}</b>\n🎟 باقی‌مانده: <b>{rem}</b>\n📦 کل دانلودها: <b>{st['total']}</b>\n⭐ سرویس پرکاربرد: <b>{html.escape(top)}</b>\n\n⏳ محدودیت روی پنجره ۲۴ ساعته حساب میشه.",
-        nav_home_keyboard())
+    st=user_download_stats(user_id); lim=effective_daily_limit(user_id); rem="∞" if not lim else max(0,lim-st["today"]); prefs=get_user_prefs(user_id)
+    top=PLATFORM_LABELS.get(st["top"],st["top"]); favs=favorite_count(user_id); q=active_user_queue_count(user_id)
+    if user_lang(user_id)=="en":
+        text=(f"📊 <b>My Profile</b>\n\n📥 Today: <b>{st['today']}</b> / <b>{lim or '∞'}</b>\n🎟 Remaining: <b>{rem}</b>\n"
+              f"📦 Total downloads: <b>{st['total']}</b>\n⭐ Favorites: <b>{favs}</b>\n📥 Active jobs: <b>{q}</b>\n"
+              f"🔥 Most used: <b>{html.escape(top)}</b>\n⚡ Quick Mode: <b>{'ON' if prefs['quick_mode'] else 'OFF'}</b>")
+    else:
+        text=(f"📊 <b>پروفایل من</b>\n\n📥 امروز: <b>{st['today']}</b> / <b>{lim or '∞'}</b>\n🎟 باقی‌مانده: <b>{rem}</b>\n"
+              f"📦 کل دانلودها: <b>{st['total']}</b>\n⭐ ذخیره‌شده‌ها: <b>{favs}</b>\n📥 Job فعال: <b>{q}</b>\n"
+              f"🔥 سرویس پرکاربرد: <b>{html.escape(top)}</b>\n⚡ Quick Mode: <b>{'روشن' if prefs['quick_mode'] else 'خاموش'}</b>")
+    kb={"inline_keyboard":[[{"text":"⚙️ Settings" if user_lang(user_id)=="en" else "⚙️ تنظیمات","callback_data":"home|settings"},{"text":"⭐ Favorites" if user_lang(user_id)=="en" else "⭐ ذخیره‌شده‌ها","callback_data":"home|favorites"}],[{"text":"🏠 Home" if user_lang(user_id)=="en" else "🏠 خانه","callback_data":"home|home"}]]}
+    await send_text(chat_id,text,kb)
 
 
-async def send_services_page(chat_id:int):
-    lines=["🟢 <b>وضعیت سرویس‌ها</b>",""]
+async def send_services_page(chat_id:int,user_id:int|None=None):
+    en=bool(user_id and user_lang(user_id)=="en")
+    lines=["🟢 <b>Service Status</b>" if en else "🟢 <b>وضعیت سرویس‌ها</b>",""]
     for p in ("instagram","youtube","twitter","soundcloud","spotify"):
         lines.append(f"{'🟢' if service_enabled(p) else '🔴'} {PLATFORM_ICONS[p]} {PLATFORM_LABELS[p]}")
     await send_text(chat_id,"\n".join(lines),nav_home_keyboard())
@@ -1739,11 +2000,11 @@ async def send_recent_menu(chat_id:int,user_id:int):
     rows=list_recent(user_id,8)
     if not rows:
         await send_text(chat_id,"🕘 <b>دانلودهای اخیر</b>\n\nهنوز چیزی اینجا نیست. اولین فایل رو دانلود کن 👇",nav_home_keyboard()); return
-    text="🕘 <b>دانلودهای اخیر</b>\n\nفایل‌های این بخش از Telegram cache دوباره ارسال می‌شن و API مصرف نمی‌کنن."
+    text=ux(user_id,"🕘 <b>دانلودهای اخیر</b>\n\nبرای ارسال دوباره روی فایل بزن.","🕘 <b>Recent Downloads</b>\n\nTap an item to send it again.")
     kb=[]
     for r in rows:
-        icon=PLATFORM_ICONS.get(r["platform"],"📦"); title=str(r["title"] or "Media").replace("\n"," ")[:38]
-        kb.append([{"text":f"{icon} {title}","callback_data":f"recent|{r['id']}"}])
+        icon=PLATFORM_ICONS.get(r["platform"],"📦"); title=str(r["title"] or "Media").replace("\n"," ")[:34]
+        kb.append([{"text":f"{icon} {title}","callback_data":f"recent|{r['id']}"},{"text":"⭐","callback_data":f"favadd|{r['id']}"}])
     kb.append([{"text":"🏠 خانه","callback_data":"home|home"}])
     await send_text(chat_id,text,{"inline_keyboard":kb})
 
@@ -1751,7 +2012,7 @@ async def send_recent_menu(chat_id:int,user_id:int):
 async def resend_recent(chat_id:int,user_id:int,recent_id:int):
     r=get_recent(user_id,recent_id)
     if not r: return await send_text(chat_id,"⌛️ این آیتم دیگه در سابقه موجود نیست.",nav_home_keyboard())
-    data={"chat_id":str(chat_id),"caption":f"{html.escape(BRAND_NAME)} · از دانلودهای اخیر","parse_mode":"HTML"}
+    data={"chat_id":str(chat_id),"caption":f"{html.escape(BRAND_NAME)} · از دانلودهای اخیر","parse_mode":"HTML"}; apply_notification_pref(chat_id,data)
     kind=r["media_type"]
     if kind=="image": data["photo"]=r["file_id"]; await tg("sendPhoto",data)
     elif kind=="video": data["video"]=r["file_id"]; data["supports_streaming"]="true"; await tg("sendVideo",data)
@@ -1801,13 +2062,20 @@ async def process_url_message(message:dict[str,Any],url:str):
     chat_id=message["chat"]["id"]; user=message.get("from",{}); user_id=user.get("id",chat_id)
     platform=detect_platform(url)
     if not service_enabled(platform): return await send_text(chat_id,f"🔴 {PLATFORM_LABELS.get(platform,platform)} فعلاً غیرفعاله.",nav_home_keyboard())
-    lim=daily_limit()
+    lim=effective_daily_limit(user_id)
     if user_id not in ADMIN_IDS and lim and user_downloads_today(user_id)>=lim:
         return await send_text(chat_id,f"🚦 سقف دانلود ۲۴ ساعته‌ات ({lim}) پر شده.",nav_home_keyboard())
     if platform=="generic": return await send_text(chat_id,"❌ این لینک فعلاً پشتیبانی نمی‌شه.",nav_home_keyboard())
     status=await send_text(chat_id,f"{PLATFORM_ICONS.get(platform,'🌐')} <b>بررسی لینک</b>\n▰▱▱▱ تشخیص محتوا…")
     try:
         result=await analyze(url); job_id=save_job(user_id,chat_id,url,result)
+        quick=quick_action_for_result(user_id,result)
+        if quick:
+            await edit_text(chat_id,status["message_id"],ux(user_id,"⚡ <b>Quick Mode</b>\nتنظیم پیش‌فرضت اعمال شد؛ میره داخل صف…","⚡ <b>Quick Mode</b>\nYour default is applied; adding to queue…"))
+            await delete_message(chat_id,status["message_id"])
+            kind,payload=quick
+            await enqueue_download({"job_id":job_id,"user_id":user_id,"chat_id":chat_id,"source_url":url,"result":result},user_id,chat_id,kind,payload)
+            return
         await edit_text(chat_id,status["message_id"],f"{PLATFORM_ICONS.get(platform,'🌐')} <b>اطلاعات آماده شد</b>\n▰▰▰▱ ساخت گزینه‌های دانلود…")
         await show_result_card(chat_id,result,job_id,status["message_id"])
     except Exception as exc:
@@ -1843,14 +2111,26 @@ async def handle_message(message:dict[str,Any]):
         return await handle_message_legacy(message)
     chat_id=message["chat"]["id"]
     if not await ensure_joined(user_id,chat_id): return
-    url=clean_url(text)
-    if url:
+    urls=extract_urls(text)
+    if urls:
         clear_user_state(user_id)
-        return await process_url_message(message,url)
+        if len(urls)>1:
+            selected=urls[:BATCH_MAX_LINKS]
+            await send_text(chat_id,ux(user_id,f"📚 <b>دانلود گروهی</b>\n{len(selected)} لینک دریافت شد. هرکدوم جدا پردازش میشه.",f"📚 <b>Batch Download</b>\n{len(selected)} links received. Each will be processed separately."))
+            for url in selected:
+                await process_url_message(message,url)
+                await asyncio.sleep(.15)
+            if len(urls)>BATCH_MAX_LINKS:
+                await send_text(chat_id,ux(user_id,f"⚠️ در هر پیام حداکثر {BATCH_MAX_LINKS} لینک پردازش میشه.",f"⚠️ Up to {BATCH_MAX_LINKS} links are processed per message."),nav_home_keyboard())
+            return
+        return await process_url_message(message,urls[0])
     state=get_user_state(user_id)
     if state and state[0]=="music_search" and text.strip():
         clear_user_state(user_id)
         return await process_music_search(chat_id,user_id,text.strip())
+    if state and state[0]=="history_search" and text.strip():
+        clear_user_state(user_id)
+        return await send_history_results(chat_id,user_id,text.strip())
     return await handle_message_legacy(message)
 
 async def handle_message_legacy(message:dict[str,Any]):
@@ -1888,7 +2168,7 @@ async def handle_message_legacy(message:dict[str,Any]):
     platform=detect_platform(url)
     if not service_enabled(platform):
         await send_text(chat_id,f"⛔️ سرویس {PLATFORM_LABELS.get(platform,platform)} فعلاً توسط ادمین غیرفعاله."); return
-    lim=daily_limit()
+    lim=effective_daily_limit(user_id)
     if user_id not in ADMIN_IDS and lim and user_downloads_today(user_id)>=lim:
         await send_text(chat_id,f"🚦 سقف دانلود روزانه‌ات ({lim}) پر شده. فردا دوباره امتحان کن."); return
     if platform=="generic":
@@ -1899,8 +2179,8 @@ async def handle_message_legacy(message:dict[str,Any]):
         await edit_text(chat_id,status["message_id"],result_text(result),build_keyboard(result,job_id))
     except Exception as exc:
         log_error(user_id,platform,exc); log.exception("analyze failed")
-        hints={"instagram":"اگر محتوا Private/Story باشه ممکنه Cookie لازم باشه.","youtube":"YouTube از FastSaver API Pool استفاده می‌کند؛ وضعیت APIها را در پنل ادمین ببین.",
-               "soundcloud":"SoundCloud گاهی extractor را موقتاً محدود می‌کند.","spotify":"Spotify فقط از FastSaver Music Search (2cr) + Music Download (7cr) استفاده می‌کند؛ Video Download استفاده نمی‌شود."}
+        hints={"instagram":"اگر محتوا Private/Story باشه ممکنه Cookie لازم باشه.","youtube":"اگر دانلود موقتاً انجام نشد، چند لحظه بعد دوباره تلاش کن.",
+               "soundcloud":"SoundCloud گاهی extractor را موقتاً محدود می‌کند.","spotify":"اگر آهنگ پیدا نشد، دوباره تلاش کن یا لینک دیگری بفرست."}
         await edit_text(chat_id,status["message_id"],f"❌ نتونستم لینک رو بخونم.\n\n💡 {hints.get(platform,'')}\n\n<code>{html.escape(str(exc))[:500]}</code>")
 
 
@@ -2029,7 +2309,7 @@ async def handle_callback_legacy(cb:dict[str,Any]):
 
 
 
-# ========================= V4.4 Production Queue =========================
+# ========================= Queue =========================
 QUEUE_RUNTIME: asyncio.PriorityQueue = asyncio.PriorityQueue()
 QUEUE_WORKERS: list[asyncio.Task] = []
 BACKGROUND_TASKS: set[asyncio.Task] = set()
@@ -2156,7 +2436,7 @@ async def deliver_artifacts(chat_id:int,user_id:int,source_job_id:str,artifacts:
     for a in artifacts:
         kind=str(a.get("media_type") or "audio"); fid=str(a.get("file_id") or "")
         if not fid: continue
-        data={"chat_id":str(chat_id),"caption":f"{html.escape(BRAND_NAME)} · {'♻️ Smart Cache' if cached else 'Queue'}","parse_mode":"HTML"}
+        data={"chat_id":str(chat_id),"caption":f"{html.escape(BRAND_NAME)} · {'ارسال سریع' if cached else 'دانلود'}","parse_mode":"HTML"}; apply_notification_pref(chat_id,data)
         if kind=="image": data["photo"]=fid; await tg("sendPhoto",data)
         elif kind=="video": data["video"]=fid; data["supports_streaming"]="true"; await tg("sendVideo",data)
         else: data["audio"]=fid; await tg("sendAudio",data)
@@ -2189,12 +2469,12 @@ def queue_status_keyboard(queue_id:str) -> dict:
 
 async def enqueue_download(job:dict[str,Any],user_id:int,chat_id:int,kind:str,payload:dict[str,Any]) -> str|None:
     if user_id not in ADMIN_IDS:
-        active=active_user_queue_count(user_id)
-        if active >= MAX_ACTIVE_JOBS_PER_USER:
-            await send_text(chat_id,f"🚦 همزمان حداکثر <b>{MAX_ACTIVE_JOBS_PER_USER}</b> درخواست فعال می‌تونی داشته باشی. یکی تموم یا لغو بشه دوباره امتحان کن.",nav_home_keyboard()); return None
+        active=active_user_queue_count(user_id); max_active=effective_max_active(user_id); cooldown=effective_cooldown(user_id)
+        if active >= max_active:
+            await send_text(chat_id,ux(user_id,f"🚦 همزمان حداکثر <b>{max_active}</b> درخواست فعال می‌تونی داشته باشی.",f"🚦 You can have up to <b>{max_active}</b> active requests at once."),nav_home_keyboard()); return None
         last=last_user_queue_created(user_id)
-        if USER_JOB_COOLDOWN and last and now_ts()-last < USER_JOB_COOLDOWN:
-            await send_text(chat_id,f"⏱ چند ثانیه فاصله بده؛ Cooldown این بات <b>{USER_JOB_COOLDOWN}s</b> است.",nav_home_keyboard()); return None
+        if cooldown and last and now_ts()-last < cooldown:
+            await send_text(chat_id,ux(user_id,f"⏱ چند ثانیه فاصله بده؛ <b>{cooldown}s</b>.",f"⏱ Please wait <b>{cooldown}s</b> between requests."),nav_home_keyboard()); return None
     counts=queue_counts()
     if counts["waiting"]+counts["running"] >= MAX_QUEUE_SIZE and user_id not in ADMIN_IDS:
         await send_text(chat_id,"🚦 صف فعلاً پره. چند دقیقه دیگه دوباره امتحان کن.",nav_home_keyboard()); return None
@@ -2202,11 +2482,11 @@ async def enqueue_download(job:dict[str,Any],user_id:int,chat_id:int,kind:str,pa
     cached=smart_cache_get(resource_key)
     if cached:
         metric_inc("cache_hit")
-        status=await send_text(chat_id,"♻️ <b>Smart Cache Hit</b>\nاین فایل قبلاً آماده شده؛ بدون مصرف API دوباره می‌فرستم…")
+        status=await send_text(chat_id,"⚡ <b>ارسال سریع</b>\nاین فایل قبلاً آماده شده؛ دوباره برات می‌فرستم…")
         try:
             n=await deliver_artifacts(chat_id,user_id,job["job_id"],cached,True)
             if n:
-                await edit_text(chat_id,status["message_id"],f"✅ <b>{n} فایل از Cache ارسال شد</b>\n⚡ بدون مصرف FastSaver",done_keyboard(job["job_id"])); return "cache"
+                await edit_text(chat_id,status["message_id"],f"✅ <b>{n} فایل ارسال شد</b>",done_keyboard(job["job_id"])); return "cache"
             raise RuntimeError("cached artifact empty")
         except Exception as exc:
             log.warning("smart cache invalid %s: %s",resource_key,exc); smart_cache_delete(resource_key)
@@ -2367,7 +2647,7 @@ async def send_admin_queue(chat_id:int) -> None:
     c=queue_counts(); cs=cache_stats(); hits=metric_get("cache_hit"); misses=metric_get("cache_miss"); dedup=metric_get("dedup_join")
     denom=hits+misses; rate=(hits*100/denom) if denom else 0
     with db() as conn: rows=conn.execute("SELECT queue_id,status,kind,priority,created_at,attempts,max_attempts FROM queue_jobs WHERE status IN ('waiting','running') ORDER BY priority,created_at LIMIT 8").fetchall()
-    text=(f"📥 <b>Production Queue · V4.4</b>\n\n⚙️ Concurrency: <b>{MAX_CONCURRENT_JOBS}</b> · Capacity: <b>{MAX_QUEUE_SIZE}</b>\n"
+    text=(f"📥 <b>مدیریت صف دانلود</b>\n\n⚙️ Concurrency: <b>{MAX_CONCURRENT_JOBS}</b> · Capacity: <b>{MAX_QUEUE_SIZE}</b>\n"
           f"🟡 Waiting: <b>{c['waiting']}</b> · 🟢 Running: <b>{c['running']}</b>\n✅ Done: <b>{c['done']}</b> · ❌ Failed: <b>{c['failed']}</b>\n"
           f"♻️ Smart Cache: <b>{cs['entries']}</b> entries · Hit rate: <b>{rate:.1f}%</b>\n🔗 Dedup joins: <b>{dedup}</b> · 🔁 Retries: <b>{metric_get('queue_retry')}</b>")
     kb=[]
@@ -2398,13 +2678,13 @@ async def fastsaver_health_manager() -> None:
         except asyncio.CancelledError: raise
         except Exception as exc: log.warning("health manager: %s",exc)
         await asyncio.sleep(FASTSAVER_HEALTH_INTERVAL)
-# ======================= /V4.4 Production Queue =========================
+# ======================= /Queue =========================
 
 async def handle_callback(cb:dict[str,Any]):
     cb_id=cb["id"]; message=cb.get("message") or {}; chat_id=message.get("chat",{}).get("id")
     user=cb.get("from",{}); user_id=user.get("id"); data=cb.get("data",""); upsert_user(user)
     if not chat_id: return await handle_callback_legacy(cb)
-    user_ux = data.startswith(("home|","recent|","again|","retry|","retryms|","report|","ms|","sp|","all|","a|","d|","qstatus|","qcancel|"))
+    user_ux = data.startswith(("home|","pref|","recent|","favadd|","favlast|","favsend|","favdel|","again|","retry|","retryms|","report|","ms|","sp|","all|","a|","d|","qstatus|","qcancel|"))
     if user_ux and user_id not in ADMIN_IDS and is_banned(user_id):
         await safe_answer_callback(cb_id,"دسترسی مسدود است.",True); return
     if user_ux and user_id not in ADMIN_IDS and bool_setting("maintenance",False):
@@ -2416,15 +2696,49 @@ async def handle_callback(cb:dict[str,Any]):
         if action=="home": return await send_user_home(chat_id,user_id,user.get("first_name",""))
         if action=="download":
             clear_user_state(user_id)
-            return await send_text(chat_id,"📥 <b>دانلود از لینک</b>\n\nلینک Instagram / YouTube / X / SoundCloud / Spotify رو بفرست؛ نوع محتوا خودکار تشخیص داده میشه.",nav_home_keyboard())
+            return await send_text(chat_id,ux(user_id,"📥 <b>دانلود از لینک</b>\n\nلینک Instagram / YouTube / X / SoundCloud / Spotify رو بفرست؛ نوع محتوا خودکار تشخیص داده میشه.","📥 <b>Download from a link</b>\n\nSend an Instagram / YouTube / X / SoundCloud / Spotify link. The content type is detected automatically."),nav_home_keyboard())
         if action=="music":
             set_user_state(user_id,"music_search")
-            return await send_text(chat_id,"🎵 <b>جستجوی موزیک</b>\n\nاسم آهنگ یا Artist رو بنویس. مثال:\n<code>The Weeknd Blinding Lights</code>\n\nیا اگر لینک Spotify/YouTube داری، همون رو مستقیم بفرست.",nav_home_keyboard())
+            return await send_text(chat_id,ux(user_id,"🎵 <b>جستجوی موزیک</b>\n\nاسم آهنگ یا Artist رو بنویس. مثال:\n<code>The Weeknd Blinding Lights</code>","🎵 <b>Music Search</b>\n\nType a song or artist. Example:\n<code>The Weeknd Blinding Lights</code>"),nav_home_keyboard())
+        if action=="batch":
+            return await send_text(chat_id,ux(user_id,f"📚 <b>دانلود گروهی</b>\n\nتا {BATCH_MAX_LINKS} لینک رو داخل یک پیام بفرست؛ هر خط یک لینک بهتره.",f"📚 <b>Batch Download</b>\n\nSend up to {BATCH_MAX_LINKS} links in one message; one URL per line works best."),nav_home_keyboard())
+        if action=="history":
+            set_user_state(user_id,"history_search"); return await send_text(chat_id,ux(user_id,"🔎 <b>جستجوی سابقه</b>\n\nاسم آهنگ، عنوان یا بخشی از لینک قبلی رو بنویس.","🔎 <b>History Search</b>\n\nType a title, artist, or part of an old URL."),nav_home_keyboard())
         if action=="recent": return await send_recent_menu(chat_id,user_id)
+        if action=="favorites": return await send_favorites_menu(chat_id,user_id)
+        if action=="settings": return await send_settings_page(chat_id,user_id)
         if action=="queue": return await send_user_queue(chat_id,user_id)
         if action=="account": return await send_account_page(chat_id,user_id)
-        if action=="services": return await send_services_page(chat_id)
-        if action=="help": return await send_text(chat_id,HELP_TEXT,nav_home_keyboard())
+        if action=="services": return await send_services_page(chat_id,user_id)
+        if action=="help":
+            help_text = HELP_TEXT if user_lang(user_id)=="fa" else ("Send a supported link and choose the format you want.\n\n📸 Instagram — posts/reels/media\n▶️ YouTube — video/audio\n𝕏 X — media\n☁️ SoundCloud — audio\n🟢 Spotify — tracks\n\nYou can also send multiple links in one message or use Music Search.")
+            return await send_text(chat_id,help_text,nav_home_keyboard())
+    if data.startswith("pref|"):
+        await safe_answer_callback(cb_id); key=data.split("|",1)[1]; p=get_user_prefs(user_id)
+        if key=="quick": set_user_pref(user_id,"quick_mode",0 if p["quick_mode"] else 1)
+        elif key=="youtube":
+            order=["ask","720","best","audio"]; cur=str(p["youtube_default"]); pos=order.index(cur) if cur in order else 0; set_user_pref(user_id,"youtube_default",order[(pos+1)%len(order)])
+        elif key=="spotify": set_user_pref(user_id,"spotify_auto",0 if p["spotify_auto"] else 1)
+        elif key=="instagram": set_user_pref(user_id,"instagram_auto",0 if p["instagram_auto"] else 1)
+        elif key=="soundcloud": set_user_pref(user_id,"soundcloud_auto",0 if p["soundcloud_auto"] else 1)
+        elif key=="notify": set_user_pref(user_id,"notifications","normal" if p["notifications"]=="silent" else "silent")
+        elif key=="language": set_user_pref(user_id,"language","fa" if p["language"]=="en" else "en")
+        return await send_settings_page(chat_id,user_id,message.get("message_id"))
+    if data.startswith("favadd|"):
+        await safe_answer_callback(cb_id,"⭐")
+        try:
+            r=get_recent(user_id,int(data.split("|",1)[1]));
+            if r: add_favorite(user_id,r); return await send_text(chat_id,ux(user_id,"⭐ ذخیره شد.","⭐ Saved."),nav_home_keyboard())
+        except Exception: pass
+        return await send_text(chat_id,ux(user_id,"⌛️ فایل پیدا نشد.","⌛️ Item not found."),nav_home_keyboard())
+    if data.startswith("favlast|"):
+        await safe_answer_callback(cb_id,"⭐"); r=recent_for_job(user_id,data.split("|",1)[1])
+        if r: add_favorite(user_id,r); return await send_text(chat_id,ux(user_id,"⭐ آخرین فایل ذخیره شد.","⭐ Latest file saved."),nav_home_keyboard())
+        return await send_text(chat_id,ux(user_id,"هنوز فایلی برای ذخیره نیست.","Nothing to save yet."),nav_home_keyboard())
+    if data.startswith("favsend|"):
+        await safe_answer_callback(cb_id,ux(user_id,"در حال ارسال…","Sending…")); return await send_favorite_file(chat_id,user_id,data.split("|",1)[1])
+    if data.startswith("favdel|"):
+        await safe_answer_callback(cb_id,ux(user_id,"حذف شد","Removed")); delete_favorite(user_id,data.split("|",1)[1]); return await send_favorites_menu(chat_id,user_id)
     if data.startswith("recent|"):
         await safe_answer_callback(cb_id,"در حال ارسال…")
         try: return await resend_recent(chat_id,user_id,int(data.split("|",1)[1]))
@@ -2461,7 +2775,7 @@ async def handle_callback(cb:dict[str,Any]):
     if data.startswith("qcancel|"):
         await safe_answer_callback(cb_id,"لغو شد ✅"); qid=data.split("|",1)[1]; ok=await cancel_queue_subscription(qid,user_id,False)
         return await send_text(chat_id,"❌ درخواستت از صف حذف شد." if ok else "این Job دیگه فعال نیست.",nav_home_keyboard())
-    # Download actions now go through the production queue.
+    # Download actions are handled through the queue.
     parts=data.split("|")
     if parts[0] in {"sp","all","a","d"}:
         await safe_answer_callback(cb_id,"به صف اضافه می‌کنم…")
@@ -2474,6 +2788,19 @@ async def handle_callback(cb:dict[str,Any]):
         else: job=None
         if not job or job["user_id"]!=user_id: return await send_text(chat_id,"⌛️ درخواست منقضی شده؛ لینک رو دوباره بفرست.",nav_home_keyboard())
         return await enqueue_download(job,user_id,chat_id,kind,payload)
+    if data.startswith("userdetail|"):
+        if user_id not in ADMIN_IDS: return await safe_answer_callback(cb_id,"Access denied",True)
+        await safe_answer_callback(cb_id); return await send_admin_user_detail(chat_id,int(data.split("|",1)[1]))
+    if data.startswith("userov|"):
+        if user_id not in ADMIN_IDS: return
+        _,uid,field=data.split("|",2); await safe_answer_callback(cb_id); set_admin_state(user_id,"user_"+field,uid)
+        return await send_text(chat_id,"عدد جدید رو بفرست. -1 یعنی تنظیم عمومی؛ Daily=0 یعنی نامحدود.")
+    if data.startswith("usermsg|"):
+        if user_id not in ADMIN_IDS: return
+        uid=data.split("|",1)[1]; await safe_answer_callback(cb_id); set_admin_state(user_id,"user_message",uid); return await send_text(chat_id,"📨 پیام رو بفرست.")
+    if data.startswith("userreset|"):
+        if user_id not in ADMIN_IDS: return
+        uid=int(data.split("|",1)[1]); reset_user_overrides(uid); await safe_answer_callback(cb_id,"Reset ✅"); return await send_admin_user_detail(chat_id,uid)
     if data.startswith("admcancelq|"):
         if user_id not in ADMIN_IDS: return
         await safe_answer_callback(cb_id,"لغو شد"); await cancel_queue_subscription(data.split("|",1)[1],user_id,True); return await send_admin_queue(chat_id)
@@ -2486,7 +2813,7 @@ async def startup():
     for i in range(MAX_CONCURRENT_JOBS):
         task=asyncio.create_task(queue_worker(i+1),name=f"queue-worker-{i+1}"); QUEUE_WORKERS.append(task); BACKGROUND_TASKS.add(task); task.add_done_callback(BACKGROUND_TASKS.discard)
     ht=asyncio.create_task(fastsaver_health_manager(),name="fastsaver-health"); BACKGROUND_TASKS.add(ht); ht.add_done_callback(BACKGROUND_TASKS.discard)
-    log.info("V4.4 queue started workers=%s recovered=%s",MAX_CONCURRENT_JOBS,QUEUE_RUNTIME.qsize())
+    log.info("queue started workers=%s recovered=%s",MAX_CONCURRENT_JOBS,QUEUE_RUNTIME.qsize())
     if BOT_TOKEN and WEBHOOK_URL:
         try:
             await tg("setWebhook",{"url":f"{WEBHOOK_URL}/telegram/{WEBHOOK_SECRET}","secret_token":WEBHOOK_SECRET,
@@ -2508,14 +2835,12 @@ async def shutdown():
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
-async def root(): return PlainTextResponse(f"{BRAND_NAME} V4.4 is running ✅")
+async def root(): return PlainTextResponse("OK")
 
 
 @app.get("/health")
 async def health():
-    return JSONResponse({"ok":True,"version":"4.4.0","platforms":["instagram","youtube","twitter","soundcloud","spotify"],
-                         "youtube_provider":"FastSaverAPI","spotify_provider":"FastSaverAPI","queue":queue_counts(),
-                         "queue_workers":MAX_CONCURRENT_JOBS,"smart_cache":cache_stats(),"api_pool":fastsaver_pool_summary()})
+    return JSONResponse({"ok": True})
 
 
 @app.post("/telegram/{secret}")
