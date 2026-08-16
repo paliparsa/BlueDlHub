@@ -1,6 +1,6 @@
-# BlueGate Downloader V4.3 — Smart UX
+# BlueGate Downloader V4.4 — Production Queue
 
-Multi-platform Telegram downloader with a user-first interface, two-mode admin UI, persistent Neon/PostgreSQL storage, and a multi-key FastSaver failover pool.
+Multi-platform Telegram downloader with Smart UX, Neon/PostgreSQL persistence, an unlimited FastSaver API pool, and a production-style download queue.
 
 ## Providers
 - Instagram: direct extractor path
@@ -9,56 +9,65 @@ Multi-platform Telegram downloader with a user-first interface, two-mode admin U
 - YouTube: FastSaver API Pool
 - Spotify Track: Music Search (2cr) -> Music Download / Telegram file_id (7cr)
 
-## V4.3 user UX
-- Smart Home with service health indicators and daily usage
-- Platform-aware preview cards with thumbnail, title, owner, duration and available formats
-- Contextual buttons for each platform instead of one generic download menu
-- Editable progress message during analysis/download/upload; less chat spam
-- Recent Downloads: resend Telegram-cached files without using FastSaver credits
-- Friendly user-facing errors; technical details stay in admin error logs
-- Retry and one-tap Report Problem buttons
-- Text Music Search: user can type a song/artist without sending a link
-- Account page with today/total downloads and most-used platform
-- Home navigation available across user submenus and download screens
-- First-use mini onboarding
+## New in V4.4
+- Persistent download queue backed by the same SQLite/Neon database
+- Configurable concurrent workers (`MAX_CONCURRENT_JOBS`, default 3)
+- User queue view + queue position + cancel button
+- Admin live queue dashboard and admin cancel
+- Admin requests get higher queue priority
+- Deduplication / single-flight: identical active requests share one physical download
+- Smart Cache: completed Telegram `file_id` artifacts are reused with zero FastSaver calls
+- Intelligent retry for temporary network / timeout / 429 failures
+- Anti-abuse controls: queue capacity, active jobs per user, and submit cooldown
+- Background FastSaver health checks with automatic recovery of recharged/cooldown keys
+- Admin alerts if the FastSaver pool loses all active keys and when it recovers
+- Queue/cache metrics in the admin dashboard and `/health`
 
-## Existing V4.2 features retained
-- Admin `/start` defaults to Admin Mode
-- One-tap Admin Mode <-> User Mode switch
-- Unlimited FastSaver API keys managed from Telegram
-- Automatic failover on rate limit, exhausted credits, invalid keys and network/provider failures
-- Pool strategies: Sequential, Round Robin, Most Credits
-- Per-key balance/status/priority/enable/delete controls
+## V4.3 UX retained
+- Smart Home, preview cards, contextual download buttons
+- Music Search, Recent Downloads, Account and service status
+- Editable progress, friendly errors, Retry and Report Problem
+- Admin Mode <-> User Mode switch
+
+## V4.2 API/DB retained
+- Unlimited FastSaver keys from Telegram admin panel
+- Sequential / Round Robin / Most Credits strategies
+- Failover across API keys
 - Neon/PostgreSQL persistence
-- Legacy `FASTSAVER_API_KEY` can bootstrap the pool
+- Ban, Broadcast, Force Join, service toggles, Maintenance and rate limit controls
 
-## Persistent V4.3 tables
-V4.3 automatically creates these on the existing Neon database; no manual SQL is needed:
-- `user_state` — short-lived conversational state, such as Music Search input
-- `recent_downloads` — Telegram file_id history for zero-credit resends
-- `user_reports` — one-tap problem reports
+## Persistent V4.4 tables
+Created automatically; no SQL migration is needed:
+- `queue_jobs`
+- `queue_subscribers`
+- `smart_cache`
+- `runtime_metrics`
 
-Existing users/downloads/API keys/settings are not removed.
+Existing tables and data are preserved.
 
 ## Required Render environment variables
 - `BOT_TOKEN`
 - `WEBHOOK_URL`
 - `WEBHOOK_SECRET`
 - `ADMIN_IDS`
-- `DATABASE_URL` (strongly recommended; Neon pooled connection string)
+- `DATABASE_URL` (strongly recommended, using the pooled Neon connection string)
 
-Optional:
-- `FASTSAVER_API_KEY` (legacy/bootstrap only)
-- `FASTSAVER_BASE_URL=https://api.fastsaver.io/v1`
-- `FASTSAVER_TIMEOUT=300`
-- `MAX_SEND_MB=49`
-- `MAX_PLAYLIST_ITEMS=10`
-- `BRAND_NAME=BlueGate Downloader`
-- `SUPPORT_USERNAME=BlueGateSupport`
+## Optional queue tuning
+```env
+MAX_CONCURRENT_JOBS=3
+MAX_QUEUE_SIZE=100
+MAX_ACTIVE_JOBS_PER_USER=3
+USER_JOB_COOLDOWN=3
+QUEUE_MAX_RETRIES=2
+SMART_CACHE_TTL_DAYS=90
+FASTSAVER_HEALTH_INTERVAL=600
+```
+
+Other optional variables remain compatible with V4.3/V4.2, including `FASTSAVER_API_KEY`, `FASTSAVER_BASE_URL`, `FASTSAVER_TIMEOUT`, `MAX_SEND_MB`, `MAX_PLAYLIST_ITEMS`, `BRAND_NAME`, and `SUPPORT_USERNAME`.
 
 ## Admin commands
-- `/start` -> currently selected admin/user mode
+- `/start` -> selected Admin/User mode
 - `/admin` -> Admin Mode
 - `/user` -> User Mode
 
-Read `USER_UX_V4_3.md`, `NEON_SETUP.md`, `ADMIN_V4_3.md`, and `FASTSAVER_SETUP.md`.
+Read `PRODUCTION_QUEUE_V4_4.md`, `USER_UX_V4_4.md`, `NEON_SETUP.md`, and `FASTSAVER_SETUP.md`.

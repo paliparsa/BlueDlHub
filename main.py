@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import html
+import hashlib
 import json
 import logging
 import os
@@ -33,7 +34,7 @@ logging.basicConfig(level=logging.INFO)
 # Avoid httpx logging full Telegram Bot API URLs (which contain the bot token).
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-log = logging.getLogger("bluegate-downloader-v4.3")
+log = logging.getLogger("bluegate-downloader-v4.4")
 STARTED_AT = int(time.time())
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -61,6 +62,13 @@ FASTSAVER_API_KEY = os.getenv("FASTSAVER_API_KEY", "").strip()
 FASTSAVER_BASE_URL = os.getenv("FASTSAVER_BASE_URL", "https://api.fastsaver.io/v1").strip().rstrip("/")
 FASTSAVER_BOT_USERNAME = os.getenv("FASTSAVER_BOT_USERNAME", "").strip()
 FASTSAVER_TIMEOUT = int(os.getenv("FASTSAVER_TIMEOUT", "300"))
+MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "3")))
+MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "100")))
+MAX_ACTIVE_JOBS_PER_USER = max(1, int(os.getenv("MAX_ACTIVE_JOBS_PER_USER", "3")))
+USER_JOB_COOLDOWN = max(0, int(os.getenv("USER_JOB_COOLDOWN", "3")))
+QUEUE_MAX_RETRIES = max(0, int(os.getenv("QUEUE_MAX_RETRIES", "2")))
+SMART_CACHE_TTL_DAYS = max(1, int(os.getenv("SMART_CACHE_TTL_DAYS", "90")))
+FASTSAVER_HEALTH_INTERVAL = max(60, int(os.getenv("FASTSAVER_HEALTH_INTERVAL", "600")))
 
 def prepare_runtime_cookies() -> None:
     """Materialize base64-encoded Netscape cookies from Render secrets."""
@@ -82,7 +90,7 @@ if not BOT_TOKEN:
     log.warning("BOT_TOKEN is not set")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-app = FastAPI(title="BlueGate Multi Downloader V4.3 Smart UX")
+app = FastAPI(title="BlueGate Multi Downloader V4.4 Production Queue")
 loader = instaloader.Instaloader(download_pictures=False, download_videos=False, save_metadata=False, quiet=True)
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
@@ -257,6 +265,32 @@ def init_db():
             cols = {r[1] for r in conn.execute("PRAGMA table_info(downloads)").fetchall()}
             if "platform" not in cols:
                 conn.execute("ALTER TABLE downloads ADD COLUMN platform TEXT DEFAULT 'unknown'")
+        # V4.4 production queue / dedup / smart-cache tables. These statements are compatible with SQLite + Postgres.
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS queue_jobs (
+            queue_id TEXT PRIMARY KEY, source_job_id TEXT NOT NULL, kind TEXT NOT NULL,
+            resource_key TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL,
+            priority INTEGER NOT NULL, created_at BIGINT NOT NULL, started_at BIGINT NOT NULL DEFAULT 0,
+            finished_at BIGINT NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 2, last_error TEXT
+        );
+        CREATE TABLE IF NOT EXISTS queue_subscribers (
+            subscription_id TEXT PRIMARY KEY, queue_id TEXT NOT NULL, user_id BIGINT NOT NULL,
+            chat_id BIGINT NOT NULL, status_message_id BIGINT NOT NULL, source_job_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active', created_at BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS smart_cache (
+            cache_key TEXT PRIMARY KEY, artifacts_json TEXT NOT NULL, platform TEXT,
+            title TEXT, updated_at BIGINT NOT NULL, hit_count BIGINT NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS runtime_metrics (
+            key TEXT PRIMARY KEY, value BIGINT NOT NULL DEFAULT 0
+        );
+        """)
+        # A crashed Render deploy must not leave jobs permanently in running state.
+        conn.execute("UPDATE queue_jobs SET status='waiting', started_at=0 WHERE status='running'")
+        conn.execute("DELETE FROM queue_subscribers WHERE queue_id IN (SELECT queue_id FROM queue_jobs WHERE status IN ('done','failed','cancelled') AND finished_at < ?)", (now_ts()-7*86400,))
+        conn.execute("DELETE FROM smart_cache WHERE updated_at < ?", (now_ts()-SMART_CACHE_TTL_DAYS*86400,))
         conn.execute("DELETE FROM jobs WHERE created_at < ?", (now_ts() - JOB_TTL_HOURS * 3600,))
 
     # Backwards compatibility: the old single Render key becomes pool key #1 once.
@@ -537,6 +571,9 @@ def _balance_number(data: Any) -> float | None:
     for k in preferred:
         if k in data and isinstance(data[k], (int,float)):
             return float(data[k])
+        if k in data and isinstance(data[k], str):
+            try: return float(data[k].replace(",","").strip())
+            except Exception: pass
     for v in data.values():
         if isinstance(v, dict):
             x = _balance_number(v)
@@ -920,7 +957,9 @@ async def refresh_fastsaver_key(key_id: str) -> dict[str,Any]:
     row=get_fastsaver_key(key_id)
     if not row: raise RuntimeError("API پیدا نشد.")
     data=await fastsaver_probe_key(row["key_secret"])
-    update_fastsaver_key(key_id,balance_json=json.dumps(data,ensure_ascii=False),status="active",cooldown_until=0,last_error="")
+    balance=_balance_number(data)
+    state="exhausted" if balance is not None and balance <= 0 else "active"
+    update_fastsaver_key(key_id,balance_json=json.dumps(data,ensure_ascii=False),status=state,cooldown_until=0,last_error="")
     return data
 
 
@@ -1304,10 +1343,10 @@ async def send_file(chat_id:int,path:Path,kind:str,caption:str):
 
 
 
-async def send_one(job:dict[str,Any],user_id:int,chat_id:int,idx:int,quality:str,mode:str):
+async def send_one(job:dict[str,Any],user_id:int,chat_id:int,idx:int,quality:str,mode:str,status_message_id:int|None=None):
     platform=job["result"].get("platform","generic")
     title=str((job["result"].get("media") or [{}])[idx].get("title") or job["result"].get("title") or "Media")
-    status=await send_text(chat_id,"⏳ <b>درخواست ثبت شد</b>\n▰▱▱▱ آماده‌سازی…")
+    status={"message_id":status_message_id} if status_message_id else await send_text(chat_id,"⏳ <b>درخواست ثبت شد</b>\n▰▱▱▱ آماده‌سازی…")
     try:
         if platform=="youtube" and mode=="audio":
             await edit_text(chat_id,status["message_id"],"🎵 <b>نسخه صوتی</b>\n▰▰▱▱ دریافت از FastSaver…")
@@ -1320,8 +1359,8 @@ async def send_one(job:dict[str,Any],user_id:int,chat_id:int,idx:int,quality:str
             record_download(user_id,job["job_id"],"audio","FastSaver TG file_id",0,"youtube")
             record_recent(user_id,"youtube",title,"audio","Audio",file_id,job["source_url"])
             await edit_text(chat_id,status["message_id"],"✅ <b>انجام شد</b>\nفایل صوتی ارسال شد.",done_keyboard(job["job_id"]))
-            return
-        tmp=Path(tempfile.mkdtemp(prefix="bluegate_v43_"))
+            return True
+        tmp=Path(tempfile.mkdtemp(prefix="bluegate_v44_"))
         try:
             await edit_text(chat_id,status["message_id"],"⬇️ <b>در حال آماده‌سازی فایل</b>\n▰▰▱▱ لطفاً چند لحظه…")
             path,kind,qlabel=await prepare_media(job,idx,quality,mode,tmp)
@@ -1332,19 +1371,22 @@ async def send_one(job:dict[str,Any],user_id:int,chat_id:int,idx:int,quality:str
                 fid=telegram_file_id(sent,kind)
                 if fid: record_recent(user_id,platform,title,kind,qlabel,fid,job["source_url"])
                 await edit_text(chat_id,status["message_id"],"✅ <b>دانلود کامل شد</b>\nفایل برات ارسال شد.",done_keyboard(job["job_id"]))
+                return True
             else:
                 await edit_text(chat_id,status["message_id"],"⚠️ فایل برای ارسال مستقیم بیش از حد بزرگ بود.",retry_keyboard(job["job_id"]))
+                return False
         finally:
             shutil.rmtree(tmp,ignore_errors=True)
     except Exception as exc:
         log_error(user_id,platform,exc); log.exception("send_one failed")
         await edit_text(chat_id,status["message_id"],friendly_error_text(platform,exc),retry_keyboard(job["job_id"]))
+        raise
 
 
 
-async def send_spotify(job:dict[str,Any],user_id:int,chat_id:int):
+async def send_spotify(job:dict[str,Any],user_id:int,chat_id:int,status_message_id:int|None=None):
     """Spotify Track -> Music Search (2cr) -> Music Download/tg-bot (7cr)."""
-    status=await send_text(chat_id,"🟢 <b>Spotify</b>\n▰▱▱▱ خواندن اطلاعات آهنگ…")
+    status={"message_id":status_message_id} if status_message_id else await send_text(chat_id,"🟢 <b>Spotify</b>\n▰▱▱▱ خواندن اطلاعات آهنگ…")
     try:
         m=SPOTIFY_RE.search(job["source_url"])
         if not m or m.group(1).lower() != "track": raise RuntimeError("فعلاً فقط Spotify Track تکی پشتیبانی می‌شود.")
@@ -1370,15 +1412,17 @@ async def send_spotify(job:dict[str,Any],user_id:int,chat_id:int):
         record_download(user_id,job["job_id"],"audio",qlabel,0,"spotify")
         record_recent(user_id,"spotify",title,"audio","MP3",file_id,job["source_url"])
         await edit_text(chat_id,status["message_id"],"✅ <b>Spotify Track ارسال شد</b>\n⚡ Music-only path",done_keyboard(job["job_id"]))
+        return True
     except Exception as exc:
         log_error(user_id,"spotify",exc); log.exception("spotify-music failed")
         await edit_text(chat_id,status["message_id"],friendly_error_text("spotify",exc),retry_keyboard(job["job_id"]))
+        raise
 
 
 
-async def send_all(job:dict[str,Any],user_id:int,chat_id:int):
-    if job["result"].get("platform")=="spotify": return await send_spotify(job,user_id,chat_id)
-    total=len(job["result"].get("media") or []); status=await send_text(chat_id,f"📥 <b>دانلود همه</b>\n0/{total} آماده شده")
+async def send_all(job:dict[str,Any],user_id:int,chat_id:int,status_message_id:int|None=None):
+    if job["result"].get("platform")=="spotify": return await send_spotify(job,user_id,chat_id,status_message_id)
+    total=len(job["result"].get("media") or []); status={"message_id":status_message_id} if status_message_id else await send_text(chat_id,f"📥 <b>دانلود همه</b>\n0/{total} آماده شده")
     ok_count=0; platform=job["result"].get("platform","generic")
     for idx,item in enumerate(job["result"].get("media") or []):
         tmp=Path(tempfile.mkdtemp(prefix="bluegate_all_"))
@@ -1396,14 +1440,16 @@ async def send_all(job:dict[str,Any],user_id:int,chat_id:int):
             log_error(user_id,platform,exc); log.warning("download-all item %s failed: %s",idx,exc)
         finally: shutil.rmtree(tmp,ignore_errors=True)
     await edit_text(chat_id,status["message_id"],f"✅ <b>دانلود همه تمام شد</b>\n{ok_count}/{total} فایل ارسال شد.",done_keyboard(job["job_id"]))
+    return ok_count > 0
 
 
 
 def user_home_keyboard(user_id:int) -> dict:
     rows=[
         [{"text":"📥 دانلود لینک","callback_data":"home|download"},{"text":"🎵 جستجوی موزیک","callback_data":"home|music"}],
-        [{"text":"🕘 دانلودهای اخیر","callback_data":"home|recent"},{"text":"📊 حساب من","callback_data":"home|account"}],
-        [{"text":"🟢 وضعیت سرویس‌ها","callback_data":"home|services"},{"text":"❓ راهنما","callback_data":"home|help"}],
+        [{"text":"🕘 دانلودهای اخیر","callback_data":"home|recent"},{"text":"📥 صف من","callback_data":"home|queue"}],
+        [{"text":"📊 حساب من","callback_data":"home|account"},{"text":"🟢 وضعیت سرویس‌ها","callback_data":"home|services"}],
+        [{"text":"❓ راهنما","callback_data":"home|help"}],
     ]
     if SUPPORT_USERNAME:
         rows.append([{"text":"🆘 پشتیبانی","url":f"https://t.me/{SUPPORT_USERNAME}"}])
@@ -1433,7 +1479,8 @@ def admin_keyboard() -> dict:
         [{"text":"📢 Broadcast","callback_data":"adm|broadcast"},{"text":"🔌 سرویس‌ها","callback_data":"adm|services"}],
         [{"text":"🚦 محدودیت","callback_data":"adm|limit"},{"text":"📢 Force Join","callback_data":"adm|forcejoin"}],
         [{"text":"🛠 Maintenance","callback_data":"adm|maintenance"},{"text":"❌ خطاها","callback_data":"adm|errors"}],
-        [{"text":"🩺 سیستم","callback_data":"adm|system"},{"text":"🧹 پاکسازی Jobها","callback_data":"adm|clean"}],
+        [{"text":"📥 صف دانلود","callback_data":"adm|queue"},{"text":"🩺 سیستم","callback_data":"adm|system"}],
+        [{"text":"🧹 پاکسازی Jobها","callback_data":"adm|clean"},{"text":"♻️ پاکسازی Cache","callback_data":"adm|cacheclear"}],
         [{"text":"👤 سوییچ به حالت کاربر","callback_data":"mode|user"}]
     ]}
 
@@ -1501,10 +1548,13 @@ async def send_admin_panel(chat_id:int):
     with db() as conn:
         banned=conn.execute("SELECT COUNT(*) c FROM bans").fetchone()["c"]
         errors24=conn.execute("SELECT COUNT(*) c FROM error_logs WHERE created_at>=?",(now_ts()-86400,)).fetchone()["c"]
-    lines=["🛡 <b>BlueGate Admin · V4.3</b>","",f"👥 کاربران: <b>{s['users']}</b> · 🚫 بن: <b>{banned}</b>",f"🟢 فعال ۲۴h: <b>{s['active24']}</b>",
+    qc=queue_counts(); cs=cache_stats()
+    lines=["🛡 <b>BlueGate Admin · V4.4</b>","",f"👥 کاربران: <b>{s['users']}</b> · 🚫 بن: <b>{banned}</b>",f"🟢 فعال ۲۴h: <b>{s['active24']}</b>",
            f"📥 دانلود کل: <b>{s['downloads']}</b> · امروز: <b>{s['downloads24']}</b>",f"❌ خطای ۲۴h: <b>{errors24}</b>",f"💾 حجم: <b>{gb:.2f} GB</b>",
            f"🚦 سقف روزانه: <b>{daily_limit() or 'نامحدود'}</b>",f"🛠 Maintenance: <b>{'ON' if bool_setting('maintenance',False) else 'OFF'}</b>",
-           f"⚡ API Pool: <b>{pool['total']}</b> · Active <b>{pool['active']}</b> · Limited <b>{pool['rate_limited']}</b>",f"🗃 DB: <b>{db_backend()}</b>","","📊 <b>پلتفرم‌ها</b>"]
+           f"⚡ API Pool: <b>{pool['total']}</b> · Active <b>{pool['active']}</b> · Limited <b>{pool['rate_limited']}</b>",
+           f"📥 Queue: <b>{qc['running']} running</b> · <b>{qc['waiting']} waiting</b>",f"♻️ Smart Cache: <b>{cs['entries']}</b> entries · <b>{cs['hits']}</b> reuse hits",
+           f"🗃 DB: <b>{db_backend()}</b>","","📊 <b>پلتفرم‌ها</b>"]
     for p,c in s["platforms"][:8]: lines.append(f"• {PLATFORM_LABELS.get(p,p)}: <b>{c}</b>")
     await send_text(chat_id,"\n".join(lines),admin_keyboard())
 
@@ -1527,7 +1577,8 @@ async def admin_system(chat_id:int):
     du=shutil.disk_usage('/tmp'); up=now_ts()-STARTED_AT; pool=fastsaver_pool_summary()
     text=(f"🩺 <b>System Status</b>\n\n✅ Bot: Online\n⏱ Uptime: <b>{up//3600}h {(up%3600)//60}m</b>\n"
           f"💽 /tmp free: <b>{du.free/(1024**3):.2f} GB</b>\n🗃 DB: <b>{db_backend()}</b>\n"
-          f"⚡ FastSaver Pool: <b>{pool['total']}</b> keys / <b>{pool['active']}</b> active\n📦 Version: <b>4.3.0</b>")
+          f"⚡ FastSaver Pool: <b>{pool['total']}</b> keys / <b>{pool['active']}</b> active\n"
+          f"📥 Queue workers: <b>{MAX_CONCURRENT_JOBS}</b> · active <b>{queue_counts()['running']}</b> · waiting <b>{queue_counts()['waiting']}</b>\n📦 Version: <b>4.4.0</b>")
     await send_text(chat_id,text)
 
 
@@ -1728,9 +1779,9 @@ async def process_music_search(chat_id:int,user_id:int,query:str):
         await edit_text(chat_id,status["message_id"],friendly_error_text("youtube",exc),retry_keyboard(job_id))
 
 
-async def send_music_search_item(job:dict[str,Any],user_id:int,chat_id:int,idx:int):
+async def send_music_search_item(job:dict[str,Any],user_id:int,chat_id:int,idx:int,status_message_id:int|None=None):
     item=job["result"]["media"][idx]; video_id=str(item.get("id") or ""); title=str(item.get("title") or "Music")
-    status=await send_text(chat_id,"🎧 <b>Music Download</b>\n▰▰▱ آماده‌سازی فایل…")
+    status={"message_id":status_message_id} if status_message_id else await send_text(chat_id,"🎧 <b>Music Download</b>\n▰▰▱ آماده‌سازی فایل…")
     try:
         bot_username=(await ensure_bot_username()).lower(); cache_key=f"music:{video_id}:{bot_username}"
         file_id=await fastsaver_audio_file_id(video_id,cache_key,title,"youtube")
@@ -1739,9 +1790,11 @@ async def send_music_search_item(job:dict[str,Any],user_id:int,chat_id:int,idx:i
         record_download(user_id,job["job_id"],"audio","Music Search + Download",0,"youtube")
         record_recent(user_id,"youtube",title,"audio","Music",file_id,job["source_url"])
         await edit_text(chat_id,status["message_id"],"✅ <b>آهنگ ارسال شد</b>",done_keyboard(job["job_id"]))
+        return True
     except Exception as exc:
         log_error(user_id,"youtube",exc); log.exception("music item failed")
         await edit_text(chat_id,status["message_id"],friendly_error_text("youtube",exc),retry_music_keyboard(job["job_id"],idx))
+        raise
 
 
 async def process_url_message(message:dict[str,Any],url:str):
@@ -1897,6 +1950,16 @@ async def handle_callback_legacy(cb:dict[str,Any]):
             new=not bool_setting('maintenance',False); set_setting('maintenance','1' if new else '0'); await send_text(chat_id,f"🛠 Maintenance: <b>{'ON' if new else 'OFF'}</b>")
         elif action=="errors": await admin_errors(chat_id)
         elif action=="system": await admin_system(chat_id)
+        elif action=="queue": await send_admin_queue(chat_id)
+        elif action=="queueclean":
+            with db() as conn:
+                old_ids=[r["queue_id"] for r in conn.execute("SELECT queue_id FROM queue_jobs WHERE status IN ('done','failed','cancelled') AND finished_at < ?",(now_ts()-3600,)).fetchall()]
+                for qid in old_ids: conn.execute("DELETE FROM queue_subscribers WHERE queue_id=?",(qid,))
+                conn.execute("DELETE FROM queue_jobs WHERE status IN ('done','failed','cancelled') AND finished_at < ?",(now_ts()-3600,))
+            await send_admin_queue(chat_id)
+        elif action=="cacheclear":
+            with db() as conn: conn.execute("DELETE FROM smart_cache")
+            await send_text(chat_id,"♻️ Smart Cache پاک شد."); await send_admin_panel(chat_id)
         else: await send_admin_panel(chat_id)
         return
     if data=="apiadd":
@@ -1965,11 +2028,383 @@ async def handle_callback_legacy(cb:dict[str,Any]):
 
 
 
+
+# ========================= V4.4 Production Queue =========================
+QUEUE_RUNTIME: asyncio.PriorityQueue = asyncio.PriorityQueue()
+QUEUE_WORKERS: list[asyncio.Task] = []
+BACKGROUND_TASKS: set[asyncio.Task] = set()
+RUNNING_QUEUE_TASKS: dict[str, asyncio.Task] = {}
+QUEUE_ENQUEUED_IDS: set[str] = set()
+API_POOL_LAST_HEALTH: int | None = None
+
+
+def metric_inc(key:str, amount:int=1) -> None:
+    try:
+        with db() as conn:
+            conn.execute("INSERT INTO runtime_metrics(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=runtime_metrics.value+excluded.value",(key,int(amount)))
+    except Exception: pass
+
+
+def metric_get(key:str) -> int:
+    try:
+        with db() as conn:
+            row=conn.execute("SELECT value FROM runtime_metrics WHERE key=?",(key,)).fetchone()
+        return int(row["value"] if row else 0)
+    except Exception: return 0
+
+
+def queue_counts() -> dict[str,int]:
+    with db() as conn:
+        rows=conn.execute("SELECT status,COUNT(*) c FROM queue_jobs GROUP BY status").fetchall()
+    out={"waiting":0,"running":0,"done":0,"failed":0,"cancelled":0}
+    for r in rows: out[str(r["status"])]=int(r["c"] or 0)
+    return out
+
+
+def active_user_queue_count(user_id:int) -> int:
+    with db() as conn:
+        row=conn.execute("""SELECT COUNT(*) c FROM queue_subscribers s JOIN queue_jobs q ON q.queue_id=s.queue_id
+                            WHERE s.user_id=? AND s.status='active' AND q.status IN ('waiting','running')""",(user_id,)).fetchone()
+    return int(row["c"] or 0)
+
+
+def last_user_queue_created(user_id:int) -> int:
+    with db() as conn:
+        row=conn.execute("SELECT COALESCE(MAX(created_at),0) t FROM queue_subscribers WHERE user_id=?",(user_id,)).fetchone()
+    return int(row["t"] or 0)
+
+
+def queue_resource_key(kind:str, job:dict[str,Any], payload:dict[str,Any]) -> str:
+    result=job.get("result") or {}; platform=result.get("platform","generic")
+    raw=[kind,platform,job.get("source_url","")]
+    if kind=="one":
+        idx=int(payload.get("idx",0)); media=result.get("media") or []
+        item=media[idx] if 0 <= idx < len(media) else {}
+        raw += [str(item.get("id") or item.get("playlist_index") or idx),str(payload.get("mode")),str(payload.get("quality"))]
+    elif kind=="music":
+        idx=int(payload.get("idx",0)); media=result.get("media") or []
+        item=media[idx] if 0 <= idx < len(media) else {}
+        raw += [str(item.get("id") or idx)]
+    raw_text="|".join(raw)
+    return hashlib.sha256(raw_text.encode("utf-8","ignore")).hexdigest()
+
+
+def queue_priority(user_id:int) -> int:
+    return 0 if user_id in ADMIN_IDS else 100
+
+
+def queue_get(queue_id:str):
+    with db() as conn: return conn.execute("SELECT * FROM queue_jobs WHERE queue_id=?",(queue_id,)).fetchone()
+
+
+def queue_subscribers(queue_id:str, active_only:bool=True):
+    with db() as conn:
+        sql="SELECT * FROM queue_subscribers WHERE queue_id=?"
+        if active_only: sql += " AND status='active'"
+        return conn.execute(sql,(queue_id,)).fetchall()
+
+
+def queue_find_active_by_resource(resource_key:str):
+    with db() as conn:
+        return conn.execute("SELECT * FROM queue_jobs WHERE resource_key=? AND status IN ('waiting','running') ORDER BY created_at ASC LIMIT 1",(resource_key,)).fetchone()
+
+
+def smart_cache_get(cache_key:str):
+    with db() as conn:
+        row=conn.execute("SELECT * FROM smart_cache WHERE cache_key=?",(cache_key,)).fetchone()
+        if not row: return None
+        if int(row["updated_at"] or 0) < now_ts()-SMART_CACHE_TTL_DAYS*86400:
+            conn.execute("DELETE FROM smart_cache WHERE cache_key=?",(cache_key,)); return None
+        try: artifacts=json.loads(row["artifacts_json"])
+        except Exception: conn.execute("DELETE FROM smart_cache WHERE cache_key=?",(cache_key,)); return None
+        conn.execute("UPDATE smart_cache SET hit_count=hit_count+1 WHERE cache_key=?",(cache_key,))
+    return artifacts if isinstance(artifacts,list) else None
+
+
+def smart_cache_set(cache_key:str, artifacts:list[dict[str,Any]], platform:str="", title:str="") -> None:
+    if not artifacts: return
+    with db() as conn:
+        conn.execute("""INSERT INTO smart_cache(cache_key,artifacts_json,platform,title,updated_at,hit_count) VALUES(?,?,?,?,?,0)
+                        ON CONFLICT(cache_key) DO UPDATE SET artifacts_json=excluded.artifacts_json,platform=excluded.platform,title=excluded.title,updated_at=excluded.updated_at""",
+                     (cache_key,json.dumps(artifacts,ensure_ascii=False),platform,title[:300],now_ts()))
+
+
+def smart_cache_delete(cache_key:str) -> None:
+    with db() as conn: conn.execute("DELETE FROM smart_cache WHERE cache_key=?",(cache_key,))
+
+
+def recent_after(user_id:int, min_id:int) -> list[dict[str,Any]]:
+    with db() as conn:
+        rows=conn.execute("SELECT * FROM recent_downloads WHERE user_id=? AND id>? ORDER BY id ASC",(user_id,min_id)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def recent_max_id(user_id:int) -> int:
+    with db() as conn:
+        row=conn.execute("SELECT COALESCE(MAX(id),0) m FROM recent_downloads WHERE user_id=?",(user_id,)).fetchone()
+    return int(row["m"] or 0)
+
+
+def cache_stats() -> dict[str,int]:
+    with db() as conn:
+        row=conn.execute("SELECT COUNT(*) c,COALESCE(SUM(hit_count),0) h FROM smart_cache").fetchone()
+    return {"entries":int(row["c"] or 0),"hits":int(row["h"] or 0)}
+
+
+async def deliver_artifacts(chat_id:int,user_id:int,source_job_id:str,artifacts:list[dict[str,Any]],cached:bool=False) -> int:
+    delivered=0
+    for a in artifacts:
+        kind=str(a.get("media_type") or "audio"); fid=str(a.get("file_id") or "")
+        if not fid: continue
+        data={"chat_id":str(chat_id),"caption":f"{html.escape(BRAND_NAME)} · {'♻️ Smart Cache' if cached else 'Queue'}","parse_mode":"HTML"}
+        if kind=="image": data["photo"]=fid; await tg("sendPhoto",data)
+        elif kind=="video": data["video"]=fid; data["supports_streaming"]="true"; await tg("sendVideo",data)
+        else: data["audio"]=fid; await tg("sendAudio",data)
+        platform=str(a.get("platform") or "generic"); quality=str(a.get("quality") or "cached"); title=str(a.get("title") or "Media")
+        record_download(user_id,source_job_id,kind,"Smart cache" if cached else quality,0,platform)
+        record_recent(user_id,platform,title,kind,quality,fid,str(a.get("source_url") or ""))
+        delivered += 1
+    return delivered
+
+
+async def queue_edit_subscribers(queue_id:str,text:str,keyboard:dict|None=None) -> None:
+    for sub in queue_subscribers(queue_id,True):
+        try: await edit_text(int(sub["chat_id"]),int(sub["status_message_id"]),text,keyboard)
+        except Exception: pass
+
+
+def queue_position(queue_id:str) -> int:
+    q=queue_get(queue_id)
+    if not q or q["status"]!="waiting": return 0
+    with db() as conn:
+        row=conn.execute("""SELECT COUNT(*) c FROM queue_jobs WHERE status='waiting' AND
+            (priority < ? OR (priority=? AND created_at < ?))""",(q["priority"],q["priority"],q["created_at"])).fetchone()
+    return int(row["c"] or 0)+1
+
+
+def queue_status_keyboard(queue_id:str) -> dict:
+    return {"inline_keyboard":[[{"text":"🔄 وضعیت صف","callback_data":f"qstatus|{queue_id}"},{"text":"❌ لغو","callback_data":f"qcancel|{queue_id}"}],
+                               [{"text":"🏠 خانه","callback_data":"home|home"}]]}
+
+
+async def enqueue_download(job:dict[str,Any],user_id:int,chat_id:int,kind:str,payload:dict[str,Any]) -> str|None:
+    if user_id not in ADMIN_IDS:
+        active=active_user_queue_count(user_id)
+        if active >= MAX_ACTIVE_JOBS_PER_USER:
+            await send_text(chat_id,f"🚦 همزمان حداکثر <b>{MAX_ACTIVE_JOBS_PER_USER}</b> درخواست فعال می‌تونی داشته باشی. یکی تموم یا لغو بشه دوباره امتحان کن.",nav_home_keyboard()); return None
+        last=last_user_queue_created(user_id)
+        if USER_JOB_COOLDOWN and last and now_ts()-last < USER_JOB_COOLDOWN:
+            await send_text(chat_id,f"⏱ چند ثانیه فاصله بده؛ Cooldown این بات <b>{USER_JOB_COOLDOWN}s</b> است.",nav_home_keyboard()); return None
+    counts=queue_counts()
+    if counts["waiting"]+counts["running"] >= MAX_QUEUE_SIZE and user_id not in ADMIN_IDS:
+        await send_text(chat_id,"🚦 صف فعلاً پره. چند دقیقه دیگه دوباره امتحان کن.",nav_home_keyboard()); return None
+    resource_key=queue_resource_key(kind,job,payload)
+    cached=smart_cache_get(resource_key)
+    if cached:
+        metric_inc("cache_hit")
+        status=await send_text(chat_id,"♻️ <b>Smart Cache Hit</b>\nاین فایل قبلاً آماده شده؛ بدون مصرف API دوباره می‌فرستم…")
+        try:
+            n=await deliver_artifacts(chat_id,user_id,job["job_id"],cached,True)
+            if n:
+                await edit_text(chat_id,status["message_id"],f"✅ <b>{n} فایل از Cache ارسال شد</b>\n⚡ بدون مصرف FastSaver",done_keyboard(job["job_id"])); return "cache"
+            raise RuntimeError("cached artifact empty")
+        except Exception as exc:
+            log.warning("smart cache invalid %s: %s",resource_key,exc); smart_cache_delete(resource_key)
+    metric_inc("cache_miss")
+    existing=queue_find_active_by_resource(resource_key)
+    status=await send_text(chat_id,"⏳ <b>در حال ثبت در صف…</b>")
+    if existing:
+        queue_id=existing["queue_id"]; metric_inc("dedup_join")
+        sub_id=secrets.token_hex(7)
+        with db() as conn:
+            conn.execute("INSERT INTO queue_subscribers(subscription_id,queue_id,user_id,chat_id,status_message_id,source_job_id,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                         (sub_id,queue_id,user_id,chat_id,status["message_id"],job["job_id"],"active",now_ts()))
+        pos=queue_position(queue_id)
+        txt=("♻️ <b>درخواست مشابه پیدا شد</b>\nبه‌جای دانلود دوباره به همون Job وصل شدی.\n"+
+             (f"📍 جایگاه فعلی: <b>{pos}</b>" if pos else "⚙️ فایل همین الان در حال پردازشه."))
+        await edit_text(chat_id,status["message_id"],txt,queue_status_keyboard(queue_id)); return queue_id
+    queue_id=secrets.token_urlsafe(7).replace("-","").replace("_","")[:10]
+    created=now_ts(); pri=queue_priority(user_id)
+    with db() as conn:
+        conn.execute("INSERT INTO queue_jobs(queue_id,source_job_id,kind,resource_key,payload_json,status,priority,created_at,started_at,finished_at,attempts,max_attempts,last_error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (queue_id,job["job_id"],kind,resource_key,json.dumps(payload,ensure_ascii=False),"waiting",pri,created,0,0,0,QUEUE_MAX_RETRIES+1,""))
+        conn.execute("INSERT INTO queue_subscribers(subscription_id,queue_id,user_id,chat_id,status_message_id,source_job_id,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                     (secrets.token_hex(7),queue_id,user_id,chat_id,status["message_id"],job["job_id"],"active",created))
+    await queue_schedule(queue_id)
+    pos=queue_position(queue_id)
+    await edit_text(chat_id,status["message_id"],f"📥 <b>در صف دانلود قرار گرفت</b>\n📍 جایگاه: <b>{pos}</b>\n⚙️ همزمان {MAX_CONCURRENT_JOBS} Job پردازش می‌شن.",queue_status_keyboard(queue_id))
+    return queue_id
+
+
+async def queue_schedule(queue_id:str) -> None:
+    if queue_id in QUEUE_ENQUEUED_IDS: return
+    q=queue_get(queue_id)
+    if not q or q["status"]!="waiting": return
+    QUEUE_ENQUEUED_IDS.add(queue_id)
+    await QUEUE_RUNTIME.put((int(q["priority"]),int(q["created_at"]),queue_id))
+
+
+async def recover_queue_jobs() -> None:
+    with db() as conn: rows=conn.execute("SELECT queue_id FROM queue_jobs WHERE status='waiting' ORDER BY priority,created_at").fetchall()
+    for r in rows: await queue_schedule(r["queue_id"])
+
+
+async def execute_queue_download(q, producer) -> list[dict[str,Any]]:
+    source_job=load_job(q["source_job_id"])
+    if not source_job: raise RuntimeError("درخواست اصلی منقضی شده؛ لینک را دوباره بفرست.")
+    payload=json.loads(q["payload_json"] or "{}")
+    user_id=int(producer["user_id"]); chat_id=int(producer["chat_id"]); status_id=int(producer["status_message_id"])
+    min_recent=recent_max_id(user_id)
+    kind=q["kind"]
+    caught=None; ok=False
+    try:
+        if kind=="spotify": ok=await send_spotify(source_job,user_id,chat_id,status_id)
+        elif kind=="all": ok=await send_all(source_job,user_id,chat_id,status_id)
+        elif kind=="music": ok=await send_music_search_item(source_job,user_id,chat_id,int(payload["idx"]),status_id)
+        elif kind=="one": ok=await send_one(source_job,user_id,chat_id,int(payload["idx"]),str(payload["quality"]),str(payload["mode"]),status_id)
+        else: raise RuntimeError("نوع Queue Job ناشناخته است.")
+    except Exception as exc:
+        caught=exc
+    artifacts=recent_after(user_id,min_recent)
+    # If Telegram accepted the file and only a final progress edit failed, do not download it again.
+    if artifacts:
+        return [{"platform":a.get("platform"),"title":a.get("title"),"media_type":a.get("media_type"),"quality":a.get("quality"),
+                 "file_id":a.get("file_id"),"source_url":a.get("source_url")} for a in artifacts if a.get("file_id")]
+    if caught: raise caught
+    if not ok: raise RuntimeError("Job اجرا شد ولی فایل قابل Cache تولید نشد.")
+    raise RuntimeError("Job فایل قابل Cache تولید نکرد.")
+
+
+async def run_queue_job(queue_id:str) -> None:
+    q=queue_get(queue_id)
+    if not q or q["status"]!="waiting": return
+    subs=queue_subscribers(queue_id,True)
+    if not subs:
+        with db() as conn: conn.execute("UPDATE queue_jobs SET status='cancelled',finished_at=? WHERE queue_id=?",(now_ts(),queue_id))
+        return
+    producer=subs[0]
+    with db() as conn:
+        conn.execute("UPDATE queue_jobs SET status='running',started_at=?,attempts=attempts+1 WHERE queue_id=?",(now_ts(),queue_id))
+    metric_inc("queue_started")
+    await queue_edit_subscribers(queue_id,"⚙️ <b>نوبتت رسید</b>\nدانلود در حال پردازشه…",queue_status_keyboard(queue_id))
+    try:
+        artifacts=await execute_queue_download(q,producer)
+        smart_cache_set(q["resource_key"],artifacts,(load_job(q["source_job_id"]) or {}).get("result",{}).get("platform",""),artifacts[0].get("title","") if artifacts else "")
+        # Fan-out to deduplicated subscribers. Producer already received the original result.
+        for sub in queue_subscribers(queue_id,True):
+            if sub["subscription_id"]==producer["subscription_id"]: continue
+            try:
+                n=await deliver_artifacts(int(sub["chat_id"]),int(sub["user_id"]),str(sub["source_job_id"]),artifacts,True)
+                await edit_text(int(sub["chat_id"]),int(sub["status_message_id"]),f"✅ <b>{n} فایل ارسال شد</b>\n♻️ یک دانلود مشترک برای چند درخواست استفاده شد.",done_keyboard(str(sub["source_job_id"])))
+            except Exception as exc:
+                log_error(int(sub["user_id"]),"queue_fanout",exc)
+                try: await edit_text(int(sub["chat_id"]),int(sub["status_message_id"]),"❌ ارسال فایل مشترک ناموفق بود.",nav_home_keyboard())
+                except Exception: pass
+        with db() as conn: conn.execute("UPDATE queue_jobs SET status='done',finished_at=?,last_error='' WHERE queue_id=?",(now_ts(),queue_id))
+        metric_inc("queue_completed")
+    except asyncio.CancelledError:
+        with db() as conn: conn.execute("UPDATE queue_jobs SET status='cancelled',finished_at=?,last_error='cancelled' WHERE queue_id=?",(now_ts(),queue_id))
+        await queue_edit_subscribers(queue_id,"❌ <b>دانلود لغو شد</b>",nav_home_keyboard()); raise
+    except Exception as exc:
+        log_error(int(producer["user_id"]),"queue",exc); q2=queue_get(queue_id); attempts=int(q2["attempts"] or 1); max_attempts=int(q2["max_attempts"] or 1)
+        transient=isinstance(exc,(httpx.TransportError,httpx.TimeoutException)) or "429" in str(exc) or "timeout" in str(exc).lower() or "tempor" in str(exc).lower()
+        if transient and attempts < max_attempts and queue_subscribers(queue_id,True):
+            delay=min(20,3*attempts); metric_inc("queue_retry")
+            with db() as conn: conn.execute("UPDATE queue_jobs SET status='waiting',started_at=0,last_error=? WHERE queue_id=?",(str(exc)[:800],queue_id))
+            await queue_edit_subscribers(queue_id,f"🔁 <b>Retry هوشمند</b>\nخطای موقت بود؛ {delay} ثانیه دیگه خودکار دوباره امتحان می‌کنم…",queue_status_keyboard(queue_id))
+            await asyncio.sleep(delay); await queue_schedule(queue_id); return
+        with db() as conn: conn.execute("UPDATE queue_jobs SET status='failed',finished_at=?,last_error=? WHERE queue_id=?",(now_ts(),str(exc)[:1200],queue_id))
+        metric_inc("queue_failed")
+        await queue_edit_subscribers(queue_id,"❌ <b>این Job بعد از تلاش‌های مجاز ناموفق شد</b>\nمی‌تونی از کارت قبلی Retry بزنی یا لینک رو دوباره بفرستی.",nav_home_keyboard())
+
+
+async def queue_worker(worker_no:int) -> None:
+    while True:
+        pri,created,queue_id=await QUEUE_RUNTIME.get(); QUEUE_ENQUEUED_IDS.discard(queue_id)
+        try:
+            q=queue_get(queue_id)
+            if not q or q["status"]!="waiting": continue
+            task=asyncio.create_task(run_queue_job(queue_id),name=f"queue-job-{queue_id}")
+            RUNNING_QUEUE_TASKS[queue_id]=task
+            try: await task
+            finally: RUNNING_QUEUE_TASKS.pop(queue_id,None)
+        except asyncio.CancelledError: raise
+        except Exception: log.exception("queue worker %s failed job=%s",worker_no,queue_id)
+        finally: QUEUE_RUNTIME.task_done()
+
+
+async def cancel_queue_subscription(queue_id:str,user_id:int,admin:bool=False) -> bool:
+    q=queue_get(queue_id)
+    if not q or q["status"] not in {"waiting","running"}: return False
+    with db() as conn:
+        if admin:
+            conn.execute("UPDATE queue_subscribers SET status='cancelled' WHERE queue_id=? AND status='active'",(queue_id,))
+        else:
+            conn.execute("UPDATE queue_subscribers SET status='cancelled' WHERE queue_id=? AND user_id=? AND status='active'",(queue_id,user_id))
+        active=conn.execute("SELECT COUNT(*) c FROM queue_subscribers WHERE queue_id=? AND status='active'",(queue_id,)).fetchone()["c"]
+        if not active: conn.execute("UPDATE queue_jobs SET status='cancelled',finished_at=? WHERE queue_id=?",(now_ts(),queue_id))
+    if not active:
+        t=RUNNING_QUEUE_TASKS.get(queue_id)
+        if t and not t.done(): t.cancel()
+    metric_inc("queue_cancelled")
+    return True
+
+
+async def send_user_queue(chat_id:int,user_id:int) -> None:
+    with db() as conn:
+        rows=conn.execute("""SELECT q.queue_id,q.status,q.created_at,q.kind FROM queue_subscribers s JOIN queue_jobs q ON q.queue_id=s.queue_id
+                             WHERE s.user_id=? AND s.status='active' AND q.status IN ('waiting','running') ORDER BY q.priority,q.created_at LIMIT 10""",(user_id,)).fetchall()
+    if not rows: return await send_text(chat_id,"📥 <b>صف من</b>\n\nدرخواست فعال نداری.",nav_home_keyboard())
+    lines=["📥 <b>صف من</b>",""]; kb=[]
+    for r in rows:
+        pos=queue_position(r["queue_id"]); state="⚙️ در حال اجرا" if r["status"]=="running" else f"⏳ انتظار · #{pos}"
+        lines.append(f"• <code>{r['queue_id']}</code> · {state}")
+        kb.append([{"text":f"❌ لغو {r['queue_id']}","callback_data":f"qcancel|{r['queue_id']}"}])
+    kb.append([{"text":"🏠 خانه","callback_data":"home|home"}]); await send_text(chat_id,"\n".join(lines),{"inline_keyboard":kb})
+
+
+async def send_admin_queue(chat_id:int) -> None:
+    c=queue_counts(); cs=cache_stats(); hits=metric_get("cache_hit"); misses=metric_get("cache_miss"); dedup=metric_get("dedup_join")
+    denom=hits+misses; rate=(hits*100/denom) if denom else 0
+    with db() as conn: rows=conn.execute("SELECT queue_id,status,kind,priority,created_at,attempts,max_attempts FROM queue_jobs WHERE status IN ('waiting','running') ORDER BY priority,created_at LIMIT 8").fetchall()
+    text=(f"📥 <b>Production Queue · V4.4</b>\n\n⚙️ Concurrency: <b>{MAX_CONCURRENT_JOBS}</b> · Capacity: <b>{MAX_QUEUE_SIZE}</b>\n"
+          f"🟡 Waiting: <b>{c['waiting']}</b> · 🟢 Running: <b>{c['running']}</b>\n✅ Done: <b>{c['done']}</b> · ❌ Failed: <b>{c['failed']}</b>\n"
+          f"♻️ Smart Cache: <b>{cs['entries']}</b> entries · Hit rate: <b>{rate:.1f}%</b>\n🔗 Dedup joins: <b>{dedup}</b> · 🔁 Retries: <b>{metric_get('queue_retry')}</b>")
+    kb=[]
+    for r in rows:
+        icon="⚙️" if r["status"]=="running" else "⏳"; kb.append([{"text":f"{icon} {r['queue_id']} · {r['kind']}","callback_data":"noop"},{"text":"❌","callback_data":f"admcancelq|{r['queue_id']}"}])
+    kb.append([{"text":"🔄 Refresh","callback_data":"adm|queue"},{"text":"🧹 Failed/Done cleanup","callback_data":"adm|queueclean"}])
+    kb.append([{"text":"⬅️ پنل ادمین","callback_data":"adm|stats"}]); await send_text(chat_id,text,{"inline_keyboard":kb})
+
+
+async def alert_admins(text:str) -> None:
+    for admin_id in ADMIN_IDS:
+        try: await send_text(admin_id,text)
+        except Exception: pass
+
+
+async def fastsaver_health_manager() -> None:
+    global API_POOL_LAST_HEALTH
+    await asyncio.sleep(15)
+    while True:
+        try:
+            if list_fastsaver_keys(True): await refresh_all_fastsaver_keys()
+            pool=fastsaver_pool_summary(); active=int(pool["active"])
+            if active==0 and int(pool.get("total",0))>0 and (API_POOL_LAST_HEALTH is None or API_POOL_LAST_HEALTH>0):
+                await alert_admins("🚨 <b>FastSaver API Pool Down</b>\nهیچ API فعالی باقی نمونده. YouTube/Spotify ممکنه متوقف بشن.")
+            elif API_POOL_LAST_HEALTH==0 and active>0:
+                await alert_admins(f"✅ <b>FastSaver API Pool Recovered</b>\nAPI فعال: <b>{active}</b>")
+            API_POOL_LAST_HEALTH=active
+        except asyncio.CancelledError: raise
+        except Exception as exc: log.warning("health manager: %s",exc)
+        await asyncio.sleep(FASTSAVER_HEALTH_INTERVAL)
+# ======================= /V4.4 Production Queue =========================
+
 async def handle_callback(cb:dict[str,Any]):
     cb_id=cb["id"]; message=cb.get("message") or {}; chat_id=message.get("chat",{}).get("id")
     user=cb.get("from",{}); user_id=user.get("id"); data=cb.get("data",""); upsert_user(user)
     if not chat_id: return await handle_callback_legacy(cb)
-    user_ux = data.startswith(("home|","recent|","again|","retry|","retryms|","report|","ms|"))
+    user_ux = data.startswith(("home|","recent|","again|","retry|","retryms|","report|","ms|","sp|","all|","a|","d|","qstatus|","qcancel|"))
     if user_ux and user_id not in ADMIN_IDS and is_banned(user_id):
         await safe_answer_callback(cb_id,"دسترسی مسدود است.",True); return
     if user_ux and user_id not in ADMIN_IDS and bool_setting("maintenance",False):
@@ -1986,6 +2421,7 @@ async def handle_callback(cb:dict[str,Any]):
             set_user_state(user_id,"music_search")
             return await send_text(chat_id,"🎵 <b>جستجوی موزیک</b>\n\nاسم آهنگ یا Artist رو بنویس. مثال:\n<code>The Weeknd Blinding Lights</code>\n\nیا اگر لینک Spotify/YouTube داری، همون رو مستقیم بفرست.",nav_home_keyboard())
         if action=="recent": return await send_recent_menu(chat_id,user_id)
+        if action=="queue": return await send_user_queue(chat_id,user_id)
         if action=="account": return await send_account_page(chat_id,user_id)
         if action=="services": return await send_services_page(chat_id)
         if action=="help": return await send_text(chat_id,HELP_TEXT,nav_home_keyboard())
@@ -1999,10 +2435,10 @@ async def handle_callback(cb:dict[str,Any]):
         if not job or job["user_id"]!=user_id: return await send_text(chat_id,"⌛️ این درخواست منقضی شده؛ لینک رو دوباره بفرست.",nav_home_keyboard())
         return await show_result_card(chat_id,job["result"],job["job_id"])
     if data.startswith("retryms|"):
-        await safe_answer_callback(cb_id,"دوباره دانلود می‌کنم…")
+        await safe_answer_callback(cb_id,"دوباره در صف می‌ذارم…")
         _,jid,idx_s=data.split("|",2); job=load_job(jid)
         if not job or job["user_id"]!=user_id: return await send_text(chat_id,"⌛️ نتایج جستجو منقضی شدن.",nav_home_keyboard())
-        return await send_music_search_item(job,user_id,chat_id,int(idx_s))
+        return await enqueue_download(job,user_id,chat_id,"music",{"idx":int(idx_s)})
     if data.startswith("retry|"):
         await safe_answer_callback(cb_id,"دوباره امتحان می‌کنم…"); job=load_job(data.split("|",1)[1])
         if not job or job["user_id"]!=user_id: return await send_text(chat_id,"⌛️ درخواست منقضی شده.",nav_home_keyboard())
@@ -2013,17 +2449,44 @@ async def handle_callback(cb:dict[str,Any]):
             p=job["result"].get("platform","generic"); record_user_report(user_id,job["job_id"],p,job["source_url"])
         return
     if data.startswith("ms|"):
-        await safe_answer_callback(cb_id,"آماده‌سازی آهنگ…")
+        await safe_answer_callback(cb_id,"به صف اضافه می‌کنم…")
         _,jid,idx_s=data.split("|",2); job=load_job(jid)
         if not job or job["user_id"]!=user_id: return await send_text(chat_id,"⌛️ نتایج جستجو منقضی شدن؛ دوباره سرچ کن.",nav_home_keyboard())
-        try: idx=int(idx_s); return await send_music_search_item(job,user_id,chat_id,idx)
-        except Exception as exc:
-            log_error(user_id,"youtube",exc); return await send_text(chat_id,friendly_error_text("youtube",exc),retry_keyboard(jid))
+        return await enqueue_download(job,user_id,chat_id,"music",{"idx":int(idx_s)})
+    if data.startswith("qstatus|"):
+        await safe_answer_callback(cb_id); qid=data.split("|",1)[1]; q=queue_get(qid)
+        if not q: return await send_text(chat_id,"⌛️ این Job پیدا نشد.",nav_home_keyboard())
+        if user_id not in ADMIN_IDS and not any(int(x["user_id"])==user_id for x in queue_subscribers(qid,False)): return
+        pos=queue_position(qid); return await send_text(chat_id,f"📥 Job <code>{qid}</code>\nوضعیت: <b>{q['status']}</b>"+(f"\nجایگاه: <b>{pos}</b>" if pos else ""),queue_status_keyboard(qid) if q['status'] in {'waiting','running'} else nav_home_keyboard())
+    if data.startswith("qcancel|"):
+        await safe_answer_callback(cb_id,"لغو شد ✅"); qid=data.split("|",1)[1]; ok=await cancel_queue_subscription(qid,user_id,False)
+        return await send_text(chat_id,"❌ درخواستت از صف حذف شد." if ok else "این Job دیگه فعال نیست.",nav_home_keyboard())
+    # Download actions now go through the production queue.
+    parts=data.split("|")
+    if parts[0] in {"sp","all","a","d"}:
+        await safe_answer_callback(cb_id,"به صف اضافه می‌کنم…")
+        if parts[0] in {"sp","all"} and len(parts)==2:
+            job=load_job(parts[1]); kind="spotify" if parts[0]=="sp" else "all"; payload={}
+        elif parts[0]=="a" and len(parts)==4:
+            _,jid,idx_s,bitrate=parts; job=load_job(jid); kind="one"; payload={"idx":int(idx_s),"quality":bitrate,"mode":"audio"}
+        elif parts[0]=="d" and len(parts)==5:
+            _,jid,media_kind,idx_s,quality=parts; job=load_job(jid); kind="one"; payload={"idx":int(idx_s),"quality":quality,"mode":"video"}
+        else: job=None
+        if not job or job["user_id"]!=user_id: return await send_text(chat_id,"⌛️ درخواست منقضی شده؛ لینک رو دوباره بفرست.",nav_home_keyboard())
+        return await enqueue_download(job,user_id,chat_id,kind,payload)
+    if data.startswith("admcancelq|"):
+        if user_id not in ADMIN_IDS: return
+        await safe_answer_callback(cb_id,"لغو شد"); await cancel_queue_subscription(data.split("|",1)[1],user_id,True); return await send_admin_queue(chat_id)
     return await handle_callback_legacy(cb)
 
 @app.on_event("startup")
 async def startup():
     init_db()
+    await recover_queue_jobs()
+    for i in range(MAX_CONCURRENT_JOBS):
+        task=asyncio.create_task(queue_worker(i+1),name=f"queue-worker-{i+1}"); QUEUE_WORKERS.append(task); BACKGROUND_TASKS.add(task); task.add_done_callback(BACKGROUND_TASKS.discard)
+    ht=asyncio.create_task(fastsaver_health_manager(),name="fastsaver-health"); BACKGROUND_TASKS.add(ht); ht.add_done_callback(BACKGROUND_TASKS.discard)
+    log.info("V4.4 queue started workers=%s recovered=%s",MAX_CONCURRENT_JOBS,QUEUE_RUNTIME.qsize())
     if BOT_TOKEN and WEBHOOK_URL:
         try:
             await tg("setWebhook",{"url":f"{WEBHOOK_URL}/telegram/{WEBHOOK_SECRET}","secret_token":WEBHOOK_SECRET,
@@ -2037,12 +2500,22 @@ async def startup():
         except Exception: log.exception("Webhook setup failed")
 
 
+@app.on_event("shutdown")
+async def shutdown():
+    for task in list(BACKGROUND_TASKS): task.cancel()
+    for task in list(RUNNING_QUEUE_TASKS.values()): task.cancel()
+    await asyncio.gather(*list(BACKGROUND_TASKS),*list(RUNNING_QUEUE_TASKS.values()),return_exceptions=True)
+
+
 @app.api_route("/", methods=["GET", "HEAD"])
-async def root(): return PlainTextResponse(f"{BRAND_NAME} V4.3 is running ✅")
+async def root(): return PlainTextResponse(f"{BRAND_NAME} V4.4 is running ✅")
 
 
 @app.get("/health")
-async def health(): return JSONResponse({"ok":True,"version":"4.3.0","platforms":["instagram","youtube","twitter","soundcloud","spotify"],"youtube_provider":"FastSaverAPI","spotify_provider":"FastSaverAPI"})
+async def health():
+    return JSONResponse({"ok":True,"version":"4.4.0","platforms":["instagram","youtube","twitter","soundcloud","spotify"],
+                         "youtube_provider":"FastSaverAPI","spotify_provider":"FastSaverAPI","queue":queue_counts(),
+                         "queue_workers":MAX_CONCURRENT_JOBS,"smart_cache":cache_stats(),"api_pool":fastsaver_pool_summary()})
 
 
 @app.post("/telegram/{secret}")

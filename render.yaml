@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: bluegate-multi-downloader-v4-2
+    name: bluegate-multi-downloader-v4-4
     runtime: docker
     plan: free
     healthCheckPath: /health
@@ -35,3 +35,17 @@ services:
         value: "12"
       - key: SPOTIFY_ENABLED
         value: "true"
+      - key: MAX_CONCURRENT_JOBS
+        value: "3"
+      - key: MAX_QUEUE_SIZE
+        value: "100"
+      - key: MAX_ACTIVE_JOBS_PER_USER
+        value: "3"
+      - key: USER_JOB_COOLDOWN
+        value: "3"
+      - key: QUEUE_MAX_RETRIES
+        value: "2"
+      - key: SMART_CACHE_TTL_DAYS
+        value: "90"
+      - key: FASTSAVER_HEALTH_INTERVAL
+        value: "600"

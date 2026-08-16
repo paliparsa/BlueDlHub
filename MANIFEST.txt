@@ -1,20 +1,20 @@
-BlueGate Downloader V4.3 SMART UX FULL ROOT
+BlueGate Downloader V4.4 Production Queue
 
-Required runtime files:
+Runtime:
 - main.py
-- requirements.txt
 - Dockerfile
+- requirements.txt
 - start.sh
 - render.yaml
-
-Configuration/docs:
 - .env.example
 - .gitignore
+
+Documentation:
 - README.md
-- USER_UX_V4_3.md
+- VERSION
+- PRODUCTION_QUEUE_V4_4.md
+- USER_UX_V4_4.md
+- ADMIN_V4_4.md
 - NEON_SETUP.md
-- ADMIN_V4_3.md
 - FASTSAVER_SETUP.md
 - SPOTIFY_MUSIC_PATH.md
-- VERSION
-- MANIFEST.txt
