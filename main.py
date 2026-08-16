@@ -344,7 +344,33 @@ def init_db():
             user_id BIGINT NOT NULL, expires_at BIGINT NOT NULL, notice_type TEXT NOT NULL, sent_at BIGINT NOT NULL,
             PRIMARY KEY(user_id,expires_at,notice_type)
         );
+        CREATE TABLE IF NOT EXISTS wallets (
+            user_id BIGINT PRIMARY KEY, balance BIGINT NOT NULL DEFAULT 0, updated_at BIGINT NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS wallet_transactions (
+            tx_id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, amount BIGINT NOT NULL, balance_after BIGINT NOT NULL,
+            tx_type TEXT NOT NULL, note TEXT, admin_id BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS credit_packages (
+            package_id TEXT PRIMARY KEY, name TEXT NOT NULL, credits BIGINT NOT NULL DEFAULT 10000,
+            price_usd_cents INTEGER NOT NULL DEFAULT 0, price_toman BIGINT NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 0, sort_order INTEGER NOT NULL DEFAULT 100, created_at BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS credit_rates (
+            rate_key TEXT PRIMARY KEY, label TEXT NOT NULL, amount BIGINT NOT NULL DEFAULT 0, updated_at BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS wallet_plan_grants (
+            grant_id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, plan_id TEXT NOT NULL, cycle_start BIGINT NOT NULL,
+            amount BIGINT NOT NULL, created_at BIGINT NOT NULL, UNIQUE(user_id,plan_id,cycle_start)
+        );
         """)
+        # V5.2 wallet migration: monthly credits per membership plan.
+        if DATABASE_URL:
+            conn.execute("ALTER TABLE plan_permissions ADD COLUMN IF NOT EXISTS monthly_credits BIGINT NOT NULL DEFAULT 0")
+        else:
+            pcols={r[1] for r in conn.execute("PRAGMA table_info(plan_permissions)").fetchall()}
+            if "monthly_credits" not in pcols:
+                conn.execute("ALTER TABLE plan_permissions ADD COLUMN monthly_credits INTEGER NOT NULL DEFAULT 0")
         # A crashed Render deploy must not leave jobs permanently in running state.
         conn.execute("UPDATE queue_jobs SET status='waiting', started_at=0 WHERE status='running'")
         conn.execute("DELETE FROM queue_subscribers WHERE queue_id IN (SELECT queue_id FROM queue_jobs WHERE status IN ('done','failed','cancelled') AND finished_at < ?)", (now_ts()-7*86400,))
@@ -352,6 +378,7 @@ def init_db():
         conn.execute("DELETE FROM jobs WHERE created_at < ?", (now_ts() - JOB_TTL_HOURS * 3600,))
 
     seed_v5_defaults()
+    seed_wallet_defaults()
 
     # Backwards compatibility: the old single Render key becomes pool key #1 once.
     if FASTSAVER_API_KEY:
@@ -370,6 +397,7 @@ def upsert_user(user: dict[str, Any]):
             INSERT INTO users(user_id,username,first_name,joined_at,last_seen) VALUES(?,?,?,?,?)
             ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name, last_seen=excluded.last_seen
         """, (uid, user.get("username", ""), user.get("first_name", ""), now_ts(), now_ts()))
+    ensure_wallet_welcome(int(uid))
 
 
 def save_job(user_id: int, chat_id: int, source_url: str, result: dict[str, Any]) -> str:
@@ -1714,9 +1742,9 @@ async def send_all(job:dict[str,Any],user_id:int,chat_id:int,status_message_id:i
 
 # ========================= V5 Membership & Growth =========================
 DEFAULT_PLANS = {
-    "free": {"name":"Free","icon":"🆓","sort":10,"daily":20,"active":2,"cooldown":5,"batch":3,"priority":100,"yt_height":720,"yt_daily":10,"sp_daily":5,"best":0},
-    "vip": {"name":"VIP","icon":"⭐","sort":20,"daily":100,"active":5,"cooldown":1,"batch":10,"priority":50,"yt_height":1080,"yt_daily":80,"sp_daily":30,"best":0},
-    "premium": {"name":"Premium","icon":"💎","sort":30,"daily":0,"active":10,"cooldown":0,"batch":25,"priority":10,"yt_height":0,"yt_daily":0,"sp_daily":0,"best":1},
+    "free": {"name":"Free","icon":"🆓","sort":10,"daily":20,"active":2,"cooldown":5,"batch":3,"priority":100,"yt_height":720,"yt_daily":10,"sp_daily":5,"best":0,"monthly_credits":0},
+    "vip": {"name":"VIP","icon":"⭐","sort":20,"daily":100,"active":5,"cooldown":1,"batch":10,"priority":50,"yt_height":1080,"yt_daily":80,"sp_daily":30,"best":0,"monthly_credits":0},
+    "premium": {"name":"Premium","icon":"💎","sort":30,"daily":0,"active":10,"cooldown":0,"batch":25,"priority":10,"yt_height":0,"yt_daily":0,"sp_daily":0,"best":1,"monthly_credits":0},
 }
 
 def seed_v5_defaults() -> None:
@@ -1724,9 +1752,9 @@ def seed_v5_defaults() -> None:
         for pid,cfg in DEFAULT_PLANS.items():
             conn.execute("INSERT INTO plans(plan_id,name,icon,sort_order,active,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(plan_id) DO NOTHING",
                          (pid,cfg["name"],cfg["icon"],cfg["sort"],1,now_ts()))
-            conn.execute("""INSERT INTO plan_permissions(plan_id,daily_limit,max_active_jobs,cooldown,batch_limit,queue_priority,youtube_max_height,youtube_daily_limit,spotify_daily_limit,allow_best,updated_at)
-                            VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(plan_id) DO NOTHING""",
-                         (pid,cfg["daily"],cfg["active"],cfg["cooldown"],cfg["batch"],cfg["priority"],cfg["yt_height"],cfg["yt_daily"],cfg["sp_daily"],cfg["best"],now_ts()))
+            conn.execute("""INSERT INTO plan_permissions(plan_id,daily_limit,max_active_jobs,cooldown,batch_limit,queue_priority,youtube_max_height,youtube_daily_limit,spotify_daily_limit,allow_best,monthly_credits,updated_at)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(plan_id) DO NOTHING""",
+                         (pid,cfg["daily"],cfg["active"],cfg["cooldown"],cfg["batch"],cfg["priority"],cfg["yt_height"],cfg["yt_daily"],cfg["sp_daily"],cfg["best"],cfg.get("monthly_credits",0),now_ts()))
         defaults={"referral_reward_every":"3","referral_reward_days":"1","referral_reward_plan":"vip"}
         for k,v in defaults.items(): conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",(k,v))
 
@@ -1736,7 +1764,7 @@ def plan_row(plan_id:str):
 def plan_permissions_by_id(plan_id:str) -> dict[str,int]:
     with db() as conn: row=conn.execute("SELECT * FROM plan_permissions WHERE plan_id=?",(plan_id,)).fetchone()
     data=dict(row) if row else {}
-    keys=("daily_limit","max_active_jobs","cooldown","batch_limit","queue_priority","youtube_max_height","youtube_daily_limit","spotify_daily_limit","allow_best")
+    keys=("daily_limit","max_active_jobs","cooldown","batch_limit","queue_priority","youtube_max_height","youtube_daily_limit","spotify_daily_limit","allow_best","monthly_credits")
     return {k:int(data.get(k) or 0) for k in keys}
 
 def current_subscription(user_id:int) -> dict[str,Any]:
@@ -1776,6 +1804,8 @@ def grant_subscription(user_id:int,plan_id:str,duration_days:int,source:str="adm
                          (user_id,plan_id,now,expires,source,now))
         conn.execute("INSERT INTO subscription_events(event_id,user_id,event,payload,created_at) VALUES(?,?,?,?,?)",
                      (secrets.token_hex(8),user_id,"grant",json.dumps({"plan":plan_id,"days":duration_days,"source":source},ensure_ascii=False),now))
+    try: ensure_plan_monthly_credit(user_id)
+    except Exception as exc: log.warning("plan credit grant: %s",exc)
     return expires
 
 def format_remaining(expires:int) -> str:
@@ -1859,14 +1889,274 @@ def register_referral(referred_id:int,referrer_id:int) -> bool:
 def referral_count(user_id:int) -> int:
     with db() as conn: return int(conn.execute("SELECT COUNT(*) c FROM referrals WHERE referrer_user_id=?",(user_id,)).fetchone()["c"] or 0)
 
+# ========================= V5.2 Wallet & BlueCredits =========================
+CREDIT_RATE_DEFAULTS = {
+    "instagram": ("Instagram Post / Reel / Carousel", 15),
+    "instagram_story": ("Instagram Story / Highlight", 50),
+    "tiktok": ("TikTok", 15),
+    "twitter": ("X / Twitter", 15),
+    "youtube": ("YouTube", 150),
+    "youtube_high": ("YouTube 2K / 4K", 250),
+    "youtube_audio": ("YouTube Audio", 90),
+    "spotify": ("Spotify Music", 90),
+    "soundcloud": ("SoundCloud", 0),
+}
+
+def seed_wallet_defaults() -> None:
+    with db() as conn:
+        for key,(label,amount) in CREDIT_RATE_DEFAULTS.items():
+            conn.execute("INSERT INTO credit_rates(rate_key,label,amount,updated_at) VALUES(?,?,?,?) ON CONFLICT(rate_key) DO NOTHING",(key,label,amount,now_ts()))
+        for k,v in {"welcome_credits":"0","wallet_enabled":"1"}.items():
+            conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",(k,v))
+
+def wallet_enabled() -> bool:
+    return bool_setting("wallet_enabled",True)
+
+def wallet_balance(user_id:int) -> int:
+    with db() as conn:
+        row=conn.execute("SELECT balance FROM wallets WHERE user_id=?",(user_id,)).fetchone()
+        if not row:
+            conn.execute("INSERT INTO wallets(user_id,balance,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO NOTHING",(user_id,0,now_ts()))
+            return 0
+        return int(row["balance"] or 0)
+
+def wallet_adjust(user_id:int, amount:int, tx_type:str, note:str="", admin_id:int=0, allow_negative:bool=False) -> tuple[bool,int,str]:
+    amount=int(amount)
+    with db() as conn:
+        conn.execute("INSERT INTO wallets(user_id,balance,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO NOTHING",(user_id,0,now_ts()))
+        if amount < 0 and not allow_negative:
+            row=conn.execute("UPDATE wallets SET balance=balance+?,updated_at=? WHERE user_id=? AND balance+?>=0 RETURNING balance",(amount,now_ts(),user_id,amount)).fetchone()
+            if not row:
+                cur=conn.execute("SELECT balance FROM wallets WHERE user_id=?",(user_id,)).fetchone()
+                return False,int(cur["balance"] or 0) if cur else 0,"insufficient"
+        else:
+            row=conn.execute("UPDATE wallets SET balance=balance+?,updated_at=? WHERE user_id=? RETURNING balance",(amount,now_ts(),user_id)).fetchone()
+        new=int(row["balance"] or 0)
+        conn.execute("INSERT INTO wallet_transactions(tx_id,user_id,amount,balance_after,tx_type,note,admin_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                     (secrets.token_hex(9),user_id,amount,new,tx_type,note[:500],admin_id,now_ts()))
+    return True,new,"ok"
+
+def ensure_wallet_welcome(user_id:int) -> None:
+    try:
+        with db() as conn:
+            conn.execute("INSERT INTO wallets(user_id,balance,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO NOTHING",(user_id,0,now_ts()))
+            seen=conn.execute("SELECT 1 FROM wallet_transactions WHERE user_id=? AND tx_type='welcome' LIMIT 1",(user_id,)).fetchone()
+        if seen: return
+        amount=max(0,int(get_setting("welcome_credits","0") or 0))
+        if amount:
+            wallet_adjust(user_id,amount,"welcome","Welcome credits")
+        else:
+            bal=wallet_balance(user_id)
+            with db() as conn:
+                conn.execute("INSERT INTO wallet_transactions(tx_id,user_id,amount,balance_after,tx_type,note,admin_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                             (secrets.token_hex(9),user_id,0,bal,"welcome","Welcome initialized",0,now_ts()))
+    except Exception as exc:
+        log.warning("wallet welcome init: %s",exc)
+
+def wallet_transactions(user_id:int,limit:int=10):
+    with db() as conn:
+        return conn.execute("SELECT * FROM wallet_transactions WHERE user_id=? ORDER BY created_at DESC LIMIT ?",(user_id,max(1,min(limit,30)))).fetchall()
+
+def credit_rate(rate_key:str) -> int:
+    with db() as conn: row=conn.execute("SELECT amount FROM credit_rates WHERE rate_key=?",(rate_key,)).fetchone()
+    if row: return max(0,int(row["amount"] or 0))
+    return int(CREDIT_RATE_DEFAULTS.get(rate_key,(rate_key,0))[1])
+
+def set_credit_rate(rate_key:str,amount:int) -> None:
+    label=CREDIT_RATE_DEFAULTS.get(rate_key,(rate_key,0))[0]
+    with db() as conn:
+        conn.execute("INSERT INTO credit_rates(rate_key,label,amount,updated_at) VALUES(?,?,?,?) ON CONFLICT(rate_key) DO UPDATE SET label=excluded.label,amount=excluded.amount,updated_at=excluded.updated_at",(rate_key,label,max(0,int(amount)),now_ts()))
+
+def credit_rate_rows():
+    with db() as conn: return conn.execute("SELECT * FROM credit_rates ORDER BY rate_key").fetchall()
+
+def estimate_credit_cost(kind:str, job:dict[str,Any], payload:dict[str,Any]) -> tuple[int,str]:
+    if not wallet_enabled(): return 0,"wallet_off"
+    result=job.get("result") or {}; platform=str(result.get("platform") or "generic")
+    if platform=="instagram":
+        rk="instagram_story" if str(result.get("kind") or "").lower() in {"story","highlight","stories"} or "/stories/" in str(job.get("source_url") or "") else "instagram"
+    elif platform=="tiktok": rk="tiktok"
+    elif platform=="twitter": rk="twitter"
+    elif platform=="spotify" or kind=="spotify": rk="spotify"
+    elif platform=="soundcloud": rk="soundcloud"
+    elif platform=="youtube":
+        if kind=="one" and str(payload.get("mode"))=="audio": rk="youtube_audio"
+        else:
+            q=str(payload.get("quality") or "")
+            rk="youtube_high" if (q.isdigit() and int(q)>1080) or q=="b" else "youtube"
+    elif kind=="music": rk="spotify"
+    else: rk=platform
+    return credit_rate(rk),rk
+
+def active_credit_packages():
+    with db() as conn: return conn.execute("SELECT * FROM credit_packages WHERE active=1 ORDER BY sort_order,created_at").fetchall()
+
+def all_credit_packages():
+    with db() as conn: return conn.execute("SELECT * FROM credit_packages ORDER BY sort_order,created_at").fetchall()
+
+def create_credit_package() -> str:
+    pid=secrets.token_hex(4); n=len(all_credit_packages())+1
+    with db() as conn:
+        conn.execute("INSERT INTO credit_packages(package_id,name,credits,price_usd_cents,price_toman,active,sort_order,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                     (pid,f"Package {n}",10000,0,0,0,n*10,now_ts()))
+    return pid
+
+def get_credit_package(package_id:str):
+    with db() as conn: return conn.execute("SELECT * FROM credit_packages WHERE package_id=?",(package_id,)).fetchone()
+
+def update_credit_package(package_id:str,field:str,value:Any) -> None:
+    if field not in {"name","credits","price_usd_cents","price_toman","active","sort_order"}: raise ValueError("invalid package field")
+    with db() as conn: conn.execute(f"UPDATE credit_packages SET {field}=? WHERE package_id=?",(value,package_id))
+
+def delete_credit_package(package_id:str) -> None:
+    with db() as conn: conn.execute("DELETE FROM credit_packages WHERE package_id=?",(package_id,))
+
+def fmt_bc(n:int) -> str:
+    return f"{int(n):,} BC"
+
+def fmt_toman(n:int) -> str:
+    return f"{int(n):,} تومان" if int(n)>0 else "—"
+
+def fmt_usd(cents:int) -> str:
+    return f"${int(cents)/100:.2f}" if int(cents)>0 else "—"
+
+def ensure_plan_monthly_credit(user_id:int) -> int:
+    sub=current_subscription(user_id); pid=str(sub["plan_id"])
+    if pid=="free": return 0
+    pm=plan_permissions_by_id(pid); amount=max(0,int(pm.get("monthly_credits",0) or 0))
+    if not amount: return 0
+    with db() as conn: row=conn.execute("SELECT starts_at,expires_at FROM user_subscriptions WHERE user_id=?",(user_id,)).fetchone()
+    if not row: return 0
+    starts=int(row["starts_at"] or now_ts()); cycle=starts + max(0,(now_ts()-starts)//(30*86400))*(30*86400)
+    with db() as conn:
+        seen=conn.execute("SELECT 1 FROM wallet_plan_grants WHERE user_id=? AND plan_id=? AND cycle_start=?",(user_id,pid,cycle)).fetchone()
+        if seen: return 0
+        conn.execute("INSERT INTO wallet_plan_grants(grant_id,user_id,plan_id,cycle_start,amount,created_at) VALUES(?,?,?,?,?,?)",
+                     (secrets.token_hex(8),user_id,pid,cycle,amount,now_ts()))
+    wallet_adjust(user_id,amount,"plan_credit",f"{pid} monthly credit")
+    return amount
+
+async def send_wallet_page(chat_id:int,user_id:int):
+    ensure_plan_monthly_credit(user_id)
+    bal=wallet_balance(user_id); txs=wallet_transactions(user_id,5)
+    lines=["💳 <b>کیف پول BlueCredits</b>","",f"موجودی: <b>{fmt_bc(bal)}</b>","","📜 <b>تراکنش‌های اخیر</b>"]
+    for t in txs:
+        sign="+" if int(t["amount"])>=0 else ""; lines.append(f"• <code>{sign}{int(t['amount']):,}</code> · {html.escape(str(t['note'] or t['tx_type']))[:55]}")
+    if not txs: lines.append("—")
+    kb={"inline_keyboard":[[{"text":"🛒 بسته‌های اعتبار","callback_data":"wallet|packages"},{"text":"📜 تاریخچه","callback_data":"wallet|history"}],
+                           [{"text":"💸 تعرفه دانلود","callback_data":"wallet|rates"}],
+                           [{"text":"💎 اشتراک من","callback_data":"sub|me"},{"text":"🏠 خانه","callback_data":"home|home"}]]}
+    await send_text(chat_id,"\n".join(lines),kb)
+
+async def send_wallet_history(chat_id:int,user_id:int):
+    rows=wallet_transactions(user_id,15); lines=["📜 <b>تاریخچه BlueCredits</b>",""]
+    for r in rows:
+        a=int(r["amount"]); lines.append(f"{'🟢' if a>=0 else '🔻'} <b>{a:+,} BC</b> · موجودی {int(r['balance_after']):,}\n{html.escape(str(r['note'] or r['tx_type']))[:90]}")
+    if not rows: lines.append("هنوز تراکنشی ثبت نشده.")
+    await send_text(chat_id,"\n\n".join(lines),{"inline_keyboard":[[{"text":"⬅️ کیف پول","callback_data":"wallet|home"}]]})
+
+async def send_user_credit_rates(chat_id:int,user_id:int):
+    rows=credit_rate_rows(); lines=["💸 <b>تعرفه دانلود</b>",""]
+    for r in rows:
+        lines.append(f"• {html.escape(str(r['label']))}: <b>{fmt_bc(int(r['amount']))}</b>")
+    lines.append("\n♻️ فایل‌هایی که از Smart Cache ارسال بشن دوباره اعتبار مصرف نمی‌کنن.")
+    await send_text(chat_id,"\n".join(lines),{"inline_keyboard":[[{"text":"🛒 خرید اعتبار","callback_data":"wallet|packages"},{"text":"⬅️ کیف پول","callback_data":"wallet|home"}]]})
+
+async def send_credit_packages_page(chat_id:int,user_id:int):
+    rows=active_credit_packages(); lines=["🛒 <b>بسته‌های BlueCredits</b>",""]; kb=[]
+    for r in rows:
+        lines.append(f"💠 <b>{html.escape(r['name'])}</b> · {fmt_bc(r['credits'])}\n💵 {fmt_usd(r['price_usd_cents'])} · 🇮🇷 {fmt_toman(r['price_toman'])}")
+        kb.append([{"text":f"💠 {r['name']} · {int(r['credits']):,} BC","callback_data":f"walletpkg|{r['package_id']}"}])
+    if not rows: lines.append("فعلاً بسته فعالی تعریف نشده.")
+    kb.append([{"text":"⬅️ کیف پول","callback_data":"wallet|home"},{"text":"🏠 خانه","callback_data":"home|home"}])
+    await send_text(chat_id,"\n\n".join(lines),{"inline_keyboard":kb})
+
+async def send_credit_package_user(chat_id:int,user_id:int,package_id:str):
+    r=get_credit_package(package_id)
+    if not r or not int(r["active"]): return await send_credit_packages_page(chat_id,user_id)
+    text=(f"💠 <b>{html.escape(r['name'])}</b>\n\nاعتبار: <b>{fmt_bc(r['credits'])}</b>\n💵 دلار: <b>{fmt_usd(r['price_usd_cents'])}</b>\n🇮🇷 تومان: <b>{fmt_toman(r['price_toman'])}</b>\n\n"
+          f"کد بسته: <code>{r['package_id']}</code>\nبرای خرید، کد بسته رو برای پشتیبانی بفرست.")
+    rows=[]
+    if SUPPORT_USERNAME: rows.append([{"text":"🛒 ارتباط با پشتیبانی","url":f"https://t.me/{SUPPORT_USERNAME}"}])
+    rows.append([{"text":"⬅️ بسته‌ها","callback_data":"wallet|packages"}])
+    await send_text(chat_id,text,{"inline_keyboard":rows})
+
+async def send_admin_wallet_center(chat_id:int):
+    with db() as conn:
+        total=int(conn.execute("SELECT COALESCE(SUM(balance),0) s FROM wallets").fetchone()["s"] or 0)
+        holders=int(conn.execute("SELECT COUNT(*) c FROM wallets WHERE balance>0").fetchone()["c"] or 0)
+        tx24=int(conn.execute("SELECT COUNT(*) c FROM wallet_transactions WHERE created_at>=?",(now_ts()-86400,)).fetchone()["c"] or 0)
+        pkgs=int(conn.execute("SELECT COUNT(*) c FROM credit_packages").fetchone()["c"] or 0)
+    text=(f"💳 <b>BlueCredits Control</b>\n\n💠 موجودی کل کاربران: <b>{fmt_bc(total)}</b>\n👥 کیف پول دارای موجودی: <b>{holders}</b>\n📜 تراکنش ۲۴h: <b>{tx24}</b>\n📦 بسته‌ها: <b>{pkgs}</b>\n🎁 اعتبار شروع: <b>{fmt_bc(int(get_setting('welcome_credits','0') or 0))}</b>")
+    kb={"inline_keyboard":[[{"text":"📦 مدیریت بسته‌ها","callback_data":"walletadm|packages"},{"text":"⚙️ هزینه دانلودها","callback_data":"walletadm|rates"}],
+                           [{"text":"🎁 اعتبار شروع","callback_data":"walletadm|welcome"},{"text":"🔎 کیف پول کاربر","callback_data":"walletadm|find"}],
+                           [{"text":"📜 تراکنش‌های اخیر","callback_data":"walletadm|tx"},{"text":"⬅️ پنل","callback_data":"adm|stats"}]]}
+    await send_text(chat_id,text,kb)
+
+async def send_admin_packages(chat_id:int):
+    rows=all_credit_packages(); kb=[]; lines=["📦 <b>مدیریت بسته‌های اعتبار</b>","","روی هر بسته بزن و قیمت/اعتبارش رو جدا تنظیم کن."]
+    for r in rows:
+        kb.append([{"text":f"{'✅' if int(r['active']) else '⏸'} {r['name']} · {int(r['credits']):,} BC","callback_data":f"pkgadm|{r['package_id']}"}])
+    kb.append([{"text":"➕ بسته جدید","callback_data":"pkgnew"}]); kb.append([{"text":"⬅️ BlueCredits","callback_data":"adm|wallet"}])
+    await send_text(chat_id,"\n".join(lines),{"inline_keyboard":kb})
+
+async def send_admin_package_detail(chat_id:int,package_id:str):
+    r=get_credit_package(package_id)
+    if not r: return await send_admin_packages(chat_id)
+    text=(f"📦 <b>{html.escape(r['name'])}</b>\n\n💠 اعتبار: <b>{fmt_bc(r['credits'])}</b>\n💵 قیمت دلار: <b>{fmt_usd(r['price_usd_cents'])}</b>\n🇮🇷 قیمت تومان: <b>{fmt_toman(r['price_toman'])}</b>\n"
+          f"وضعیت: <b>{'فعال ✅' if int(r['active']) else 'غیرفعال ⏸'}</b>\nکد: <code>{r['package_id']}</code>")
+    kb={"inline_keyboard":[[{"text":"✏️ نام","callback_data":f"pkgedit|{package_id}|name"},{"text":"💠 اعتبار","callback_data":f"pkgedit|{package_id}|credits"}],
+                           [{"text":"💵 دلار","callback_data":f"pkgedit|{package_id}|usd"},{"text":"🇮🇷 تومان","callback_data":f"pkgedit|{package_id}|toman"}],
+                           [{"text":"⏯ فعال/غیرفعال","callback_data":f"pkgtoggle|{package_id}"},{"text":"🗑 حذف","callback_data":f"pkgdel|{package_id}"}],
+                           [{"text":"⬅️ بسته‌ها","callback_data":"walletadm|packages"}]]}
+    await send_text(chat_id,text,kb)
+
+async def send_admin_credit_rates(chat_id:int):
+    rows=credit_rate_rows(); kb=[]; lines=["⚙️ <b>هزینه دانلود با BlueCredits</b>","","این اعداد مستقل از Credit سرویس واسط هستن و هر زمان خواستی قابل تغییرن."]
+    for r in rows:
+        kb.append([{"text":f"{r['label']} · {int(r['amount']):,} BC","callback_data":f"rateedit|{r['rate_key']}"}])
+    kb.append([{"text":"⬅️ BlueCredits","callback_data":"adm|wallet"}])
+    await send_text(chat_id,"\n".join(lines),{"inline_keyboard":kb})
+
+async def send_admin_wallet_user(chat_id:int,uid:int):
+    with db() as conn: u=conn.execute("SELECT * FROM users WHERE user_id=?",(uid,)).fetchone()
+    if not u: return await send_text(chat_id,"❌ کاربر پیدا نشد.")
+    bal=wallet_balance(uid); txs=wallet_transactions(uid,5)
+    lines=["💳 <b>کیف پول کاربر</b>",f"👤 @{html.escape(u['username'] or '-')} · <code>{uid}</code>","",f"موجودی: <b>{fmt_bc(bal)}</b>","","📜 اخیر:"]
+    for t in txs: lines.append(f"• {int(t['amount']):+,} BC · {html.escape(str(t['note'] or t['tx_type']))[:55]}")
+    kb={"inline_keyboard":[[{"text":"➕ +1K","callback_data":f"walletplus|{uid}|1000"},{"text":"➕ +10K","callback_data":f"walletplus|{uid}|10000"},{"text":"➕ دلخواه","callback_data":f"walletcustom|{uid}|add"}],
+                           [{"text":"➖ -1K","callback_data":f"walletminus|{uid}|1000"},{"text":"➖ -10K","callback_data":f"walletminus|{uid}|10000"},{"text":"➖ دلخواه","callback_data":f"walletcustom|{uid}|sub"}],
+                           [{"text":"📦 اعمال بسته","callback_data":f"walletuserpkgs|{uid}"}],
+                           [{"text":"⬅️ پروفایل کاربر","callback_data":f"userdetail|{uid}"},{"text":"💳 مرکز اعتبار","callback_data":"adm|wallet"}]]}
+    await send_text(chat_id,"\n".join(lines),kb)
+
+async def send_admin_user_packages(chat_id:int,uid:int):
+    rows=active_credit_packages(); kb=[]
+    for r in rows:
+        kb.append([{"text":f"💠 {r['name']} · {int(r['credits']):,} BC","callback_data":f"walletgrantpkg|{uid}|{r['package_id']}"}])
+    if not rows:
+        return await send_text(chat_id,"📦 هنوز بسته فعالی تعریف نشده.",{"inline_keyboard":[[{"text":"⚙️ مدیریت بسته‌ها","callback_data":"walletadm|packages"},{"text":"⬅️ کیف کاربر","callback_data":f"walletuser|{uid}"}]]})
+    kb.append([{"text":"⬅️ کیف کاربر","callback_data":f"walletuser|{uid}"}])
+    await send_text(chat_id,"📦 <b>اعمال بسته برای کاربر</b>\nیکی از بسته‌ها رو انتخاب کن؛ اعتبار فوراً به کیف پول اضافه میشه.",{"inline_keyboard":kb})
+
+async def send_admin_wallet_transactions(chat_id:int):
+    with db() as conn: rows=conn.execute("SELECT * FROM wallet_transactions ORDER BY created_at DESC LIMIT 15").fetchall()
+    lines=["📜 <b>آخرین تراکنش‌های BlueCredits</b>",""]
+    for r in rows: lines.append(f"<code>{r['user_id']}</code> · <b>{int(r['amount']):+,} BC</b> · {html.escape(str(r['note'] or r['tx_type']))[:65]}")
+    if not rows: lines.append("—")
+    await send_text(chat_id,"\n".join(lines),{"inline_keyboard":[[{"text":"⬅️ BlueCredits","callback_data":"adm|wallet"}]]})
+# ======================= /V5.2 Wallet =========================
+
 async def send_subscription_page(chat_id:int,user_id:int):
     sub=current_subscription(user_id); perm=get_plan_permissions(user_id); st=user_download_stats(user_id); lim=effective_daily_limit(user_id)
+    ensure_plan_monthly_credit(user_id); bal=wallet_balance(user_id)
     remain="∞" if not lim else max(0,lim-st["today"]); expiry="∞" if not sub["expires_at"] else format_remaining(sub["expires_at"])
-    text=(f"{sub['icon']} <b>{html.escape(sub['name'])}</b>\n\n⏳ اعتبار: <b>{expiry}</b>\n📥 امروز: <b>{st['today']}</b> / <b>{lim or '∞'}</b> · باقی‌مانده <b>{remain}</b>\n"
+    text=(f"{sub['icon']} <b>{html.escape(sub['name'])}</b>\n\n⏳ اعتبار: <b>{expiry}</b>\n💳 BlueCredits: <b>{fmt_bc(bal)}</b>\n📥 امروز: <b>{st['today']}</b> / <b>{lim or '∞'}</b> · باقی‌مانده <b>{remain}</b>\n"
           f"📚 Batch: <b>{perm.get('batch_limit',0)}</b> · ⚡ Priority: <b>{perm.get('queue_priority',100)}</b>\n"
           f"▶️ YouTube max: <b>{'Best' if not perm.get('youtube_max_height') else str(perm.get('youtube_max_height'))+'p'}</b>\n"
-          f"🟢 Spotify/day: <b>{perm.get('spotify_daily_limit') or '∞'}</b>")
-    kb={"inline_keyboard":[[{"text":"🎟 فعال‌سازی کد","callback_data":"sub|redeem"},{"text":"📋 پلن‌ها","callback_data":"sub|plans"}],
+          f"🟢 Spotify/day: <b>{perm.get('spotify_daily_limit') or '∞'}</b> · 🎁 Monthly BC: <b>{fmt_bc(perm.get('monthly_credits',0))}</b>")
+    kb={"inline_keyboard":[[{"text":"💳 کیف پول","callback_data":"wallet|home"},{"text":"🛒 خرید اعتبار","callback_data":"wallet|packages"}],
+                           [{"text":"🎟 فعال‌سازی کد","callback_data":"sub|redeem"},{"text":"📋 پلن‌ها","callback_data":"sub|plans"}],
                            [{"text":"🎁 دعوت دوستان","callback_data":"sub|ref"},{"text":"🏠 خانه","callback_data":"home|home"}]]}
     await send_text(chat_id,text,kb)
 
@@ -1897,10 +2187,12 @@ async def send_admin_plan_detail(chat_id:int,plan_id:str):
     text=(f"{p['icon']} <b>{p['name']}</b> (<code>{plan_id}</code>)\n\n📥 Daily: <b>{pm['daily_limit'] or '∞'}</b>\n📥 Active: <b>{pm['max_active_jobs']}</b>\n⏱ Cooldown: <b>{pm['cooldown']}s</b>\n"
           f"📚 Batch: <b>{pm['batch_limit']}</b>\n⚡ Queue priority: <b>{pm['queue_priority']}</b>\n▶️ YouTube max: <b>{pm['youtube_max_height'] or 'Best'}</b>\n"
           f"▶️ YouTube/day: <b>{pm['youtube_daily_limit'] or '∞'}</b>\n🟢 Spotify/day: <b>{pm['spotify_daily_limit'] or '∞'}</b>")
-    fields=[("daily_limit","Daily"),("max_active_jobs","Active"),("cooldown","Cooldown"),("batch_limit","Batch"),("queue_priority","Priority"),("youtube_max_height","YT Max"),("youtube_daily_limit","YT/day"),("spotify_daily_limit","SP/day")]
+    fields=[("daily_limit","Daily"),("max_active_jobs","Active"),("cooldown","Cooldown"),("batch_limit","Batch"),("queue_priority","Priority"),("youtube_max_height","YT Max"),("youtube_daily_limit","YT/day"),("spotify_daily_limit","SP/day"),("monthly_credits","Monthly BC")]
     kb=[]
     for i in range(0,len(fields),2):
-        kb.append([{"text":fields[i][1],"callback_data":f"planedit|{plan_id}|{fields[i][0]}"},{"text":fields[i+1][1],"callback_data":f"planedit|{plan_id}|{fields[i+1][0]}"}])
+        row=[{"text":fields[i][1],"callback_data":f"planedit|{plan_id}|{fields[i][0]}"}]
+        if i+1<len(fields): row.append({"text":fields[i+1][1],"callback_data":f"planedit|{plan_id}|{fields[i+1][0]}"})
+        kb.append(row)
     kb.append([{"text":"⬅️ پلن‌ها","callback_data":"adm|plans"}]); await send_text(chat_id,text,{"inline_keyboard":kb})
 
 async def send_admin_codes(chat_id:int):
@@ -1958,6 +2250,8 @@ async def subscription_manager() -> None:
             with db() as conn: rows=conn.execute("SELECT * FROM user_subscriptions WHERE expires_at>0 ORDER BY expires_at").fetchall()
             for r in rows:
                 uid=int(r["user_id"]); exp=int(r["expires_at"]); remaining=exp-now
+                try: ensure_plan_monthly_credit(uid)
+                except Exception as exc: log.warning("monthly credit grant user=%s: %s",uid,exc)
                 if remaining<=0:
                     with db() as conn:
                         seen=conn.execute("SELECT 1 FROM subscription_notices WHERE user_id=? AND expires_at=? AND notice_type='expired'",(uid,exp)).fetchone()
@@ -1990,6 +2284,7 @@ def user_home_keyboard(user_id:int) -> dict:
         [{"text":"🕘 Recent" if en else "🕘 دانلودهای اخیر","callback_data":"home|recent"},{"text":"⭐ Favorites" if en else "⭐ ذخیره‌شده‌ها","callback_data":"home|favorites"}],
         [{"text":"🔎 History Search" if en else "🔎 جستجوی سابقه","callback_data":"home|history"},{"text":"📊 My Profile" if en else "📊 پروفایل من","callback_data":"home|account"}],
         [{"text":"⚙️ Settings" if en else "⚙️ تنظیمات دانلود","callback_data":"home|settings"},{"text":"📥 My Queue" if en else "📥 صف من","callback_data":"home|queue"}],
+        [{"text":"💳 Wallet" if en else "💳 کیف پول","callback_data":"wallet|home"},{"text":"🛒 Credits" if en else "🛒 خرید اعتبار","callback_data":"wallet|packages"}],
         [{"text":"💎 My Plan" if en else "💎 اشتراک من","callback_data":"sub|me"},{"text":"🎁 Invite" if en else "🎁 دعوت دوستان","callback_data":"sub|ref"}],
         [{"text":"📚 Batch Links" if en else "📚 دانلود گروهی","callback_data":"home|batch"},{"text":"🟢 Services" if en else "🟢 وضعیت سرویس‌ها","callback_data":"home|services"}],
         [{"text":"❓ Help" if en else "❓ راهنما","callback_data":"home|help"}],
@@ -2002,7 +2297,7 @@ def user_home_keyboard(user_id:int) -> dict:
 
 
 async def send_user_home(chat_id:int,user_id:int,first_name:str=""):
-    st=user_download_stats(user_id); lim=effective_daily_limit(user_id); remaining="∞" if not lim else max(0,lim-st["today"]); prefs=get_user_prefs(user_id); sub=current_subscription(user_id)
+    st=user_download_stats(user_id); lim=effective_daily_limit(user_id); remaining="∞" if not lim else max(0,lim-st["today"]); prefs=get_user_prefs(user_id); sub=current_subscription(user_id); ensure_plan_monthly_credit(user_id); bc=wallet_balance(user_id)
     service_line=" · ".join(f"{PLATFORM_ICONS[p]}{'🟢' if service_enabled(p) else '🔴'}" for p in ("instagram","tiktok","youtube","twitter","soundcloud","spotify"))
     if user_lang(user_id)=="en":
         intro="\n\n<b>Three steps:</b> send a link → choose format → get the file." if st["total"]==0 else ""
@@ -2104,6 +2399,7 @@ def admin_keyboard() -> dict:
         [{"text":"📊 داشبورد","callback_data":"adm|stats"},{"text":"💎 پلن‌ها","callback_data":"adm|plans"}],
         [{"text":"🎟 کدها","callback_data":"adm|codes"},{"text":"🎁 Referral","callback_data":"adm|referral"}],
         [{"text":"📢 کمپین‌ها","callback_data":"adm|campaigns"},{"text":"⚡ FastSaver APIs","callback_data":"adm|apis"}],
+        [{"text":"💳 BlueCredits","callback_data":"adm|wallet"},{"text":"📦 قیمت‌گذاری","callback_data":"walletadm|packages"}],
         [{"text":"👥 کاربران","callback_data":"adm|users"},{"text":"🚫 Ban/Unban","callback_data":"adm|userfind"}],
         [{"text":"📢 Broadcast","callback_data":"adm|broadcast"},{"text":"🔌 سرویس‌ها","callback_data":"adm|services"}],
         [{"text":"🆓 سقف Free","callback_data":"adm|limit"},{"text":"📢 Force Join","callback_data":"adm|forcejoin"}],
@@ -2180,12 +2476,14 @@ async def send_admin_panel(chat_id:int):
         errors24=conn.execute("SELECT COUNT(*) c FROM error_logs WHERE created_at>=?",(now_ts()-86400,)).fetchone()["c"]
     qc=queue_counts(); cs=cache_stats()
     with db() as conn:
+        wallet_total=int(conn.execute("SELECT COALESCE(SUM(balance),0) s FROM wallets").fetchone()["s"] or 0)
         subrows=conn.execute("SELECT plan_id,COUNT(*) c FROM user_subscriptions WHERE expires_at=0 OR expires_at>? GROUP BY plan_id",(now_ts(),)).fetchall()
     pcounts={r['plan_id']:int(r['c']) for r in subrows}
     lines=["🛡 <b>BlueGate Control Center</b>","",f"👥 کاربران: <b>{s['users']}</b> · 🚫 بن: <b>{banned}</b>",f"🟢 فعال ۲۴h: <b>{s['active24']}</b>",
            f"📥 دانلود کل: <b>{s['downloads']}</b> · امروز: <b>{s['downloads24']}</b>",f"❌ خطای ۲۴h: <b>{errors24}</b>",f"💾 حجم: <b>{gb:.2f} GB</b>",
            f"🆓 سقف Free: <b>{plan_permissions_by_id('free').get('daily_limit',20) or 'نامحدود'}</b>",f"🛠 Maintenance: <b>{'ON' if bool_setting('maintenance',False) else 'OFF'}</b>",
            f"⚡ API Pool: <b>{pool['total']}</b> · Active <b>{pool['active']}</b> · Limited <b>{pool['rate_limited']}</b>",
+           f"💳 BlueCredits کاربران: <b>{fmt_bc(wallet_total)}</b>",
            f"📥 Queue: <b>{qc['running']} running</b> · <b>{qc['waiting']} waiting</b>",f"♻️ Smart Cache: <b>{cs['entries']}</b> entries · <b>{cs['hits']}</b> reuse hits",
            f"🗃 DB: <b>{db_backend()}</b>","","📊 <b>پلتفرم‌ها</b>"]
     for p,c in s["platforms"][:8]: lines.append(f"• {PLATFORM_LABELS.get(p,p)}: <b>{c}</b>")
@@ -2204,7 +2502,7 @@ async def admin_users(chat_id:int):
 async def send_admin_user_detail(chat_id:int,uid:int):
     with db() as conn: row=conn.execute("SELECT * FROM users WHERE user_id=?",(uid,)).fetchone()
     if not row: return await send_text(chat_id,"❌ کاربر پیدا نشد.")
-    st=user_download_stats(uid); ov=get_user_override(uid); prefs=get_user_prefs(uid); banned=is_banned(uid); lim=effective_daily_limit(uid); sub=current_subscription(uid)
+    st=user_download_stats(uid); ov=get_user_override(uid); prefs=get_user_prefs(uid); banned=is_banned(uid); lim=effective_daily_limit(uid); sub=current_subscription(uid); bc=wallet_balance(uid)
     text=(f"👤 <b>{html.escape(row['first_name'] or '')}</b> @{html.escape(row['username'] or '-')}\nID: <code>{uid}</code>\n\n"
           f"وضعیت: <b>{'BANNED' if banned else 'ACTIVE'}</b> · {sub['icon']} <b>{html.escape(sub['name'])}</b> · ⏳ <b>{format_remaining(sub['expires_at'])}</b>\n📥 امروز: <b>{st['today']}</b> / <b>{lim or '∞'}</b> · کل: <b>{st['total']}</b>\n"
           f"⭐ Favorites: <b>{favorite_count(uid)}</b> · Queue: <b>{active_user_queue_count(uid)}</b>\n"
@@ -2213,6 +2511,7 @@ async def send_admin_user_detail(chat_id:int,uid:int):
           "<i>-1 یعنی استفاده از تنظیم عمومی.</i>")
     kb={"inline_keyboard":[
         [{"text":"✅ Unban" if banned else "🚫 Ban","callback_data":f"adminban|{uid}|{0 if banned else 1}"},{"text":"📨 پیام","callback_data":f"usermsg|{uid}"}],
+        [{"text":"💳 کیف پول","callback_data":f"walletuser|{uid}"}],
         [{"text":"⭐ VIP","callback_data":f"subgrant|{uid}|vip"},{"text":"💎 Premium","callback_data":f"subgrant|{uid}|premium"}],
         [{"text":"🆓 Free","callback_data":f"subfree|{uid}"},{"text":"🎟 Daily Limit","callback_data":f"userov|{uid}|daily_limit"}],
         [{"text":"📥 Active Jobs","callback_data":f"userov|{uid}|max_active_jobs"},{"text":"⏱ Cooldown","callback_data":f"userov|{uid}|cooldown"}],
@@ -2289,7 +2588,7 @@ async def handle_admin_input(user_id:int,chat_id:int,text:str,state:tuple[str,st
         return True
     if action=="plan_edit":
         try:
-            plan_id,field=payload.split('|',1); allowed={'daily_limit','max_active_jobs','cooldown','batch_limit','queue_priority','youtube_max_height','youtube_daily_limit','spotify_daily_limit'}
+            plan_id,field=payload.split('|',1); allowed={'daily_limit','max_active_jobs','cooldown','batch_limit','queue_priority','youtube_max_height','youtube_daily_limit','spotify_daily_limit','monthly_credits'}
             if field not in allowed: raise ValueError()
             n=int(text.strip())
             if n<0: raise ValueError()
@@ -2322,6 +2621,42 @@ async def handle_admin_input(user_id:int,chat_id:int,text:str,state:tuple[str,st
             with db() as conn: conn.execute("UPDATE plan_permissions SET daily_limit=?,updated_at=? WHERE plan_id='free'",(n,now_ts()))
             audit_admin(user_id,'plan.edit','free',{'daily_limit':n}); await send_text(chat_id,f"✅ سقف روزانه Free شد <b>{n or 'نامحدود'}</b>.")
         except Exception: await send_text(chat_id,"❌ فقط عدد بفرست؛ 0 یعنی نامحدود.")
+        return True
+    if action=="wallet_find":
+        q=text.strip().lstrip('@')
+        with db() as conn:
+            row=conn.execute("SELECT * FROM users WHERE user_id=?",(int(q),)).fetchone() if q.lstrip('-').isdigit() else conn.execute("SELECT * FROM users WHERE lower(username)=lower(?)",(q,)).fetchone()
+        if not row: await send_text(chat_id,"❌ کاربر پیدا نشد."); return True
+        await send_admin_wallet_user(chat_id,int(row["user_id"])); return True
+    if action in {"wallet_add_custom","wallet_sub_custom"}:
+        try:
+            uid=int(payload); n=abs(int(text.strip().replace(',',''))); amount=n if action=="wallet_add_custom" else -n
+            ok,bal,_=wallet_adjust(uid,amount,"admin_adjust","Admin wallet adjustment",user_id)
+            if not ok: await send_text(chat_id,"❌ موجودی کاربر برای این مقدار کم کردن کافی نیست."); return True
+            audit_admin(user_id,"wallet.adjust",str(uid),{"amount":amount,"balance":bal}); await send_admin_wallet_user(chat_id,uid)
+        except Exception: await send_text(chat_id,"❌ فقط عدد مثبت بفرست.")
+        return True
+    if action=="wallet_welcome":
+        try:
+            n=max(0,int(text.strip().replace(',',''))); set_setting("welcome_credits",str(n)); audit_admin(user_id,"wallet.welcome","",{"amount":n})
+            await send_text(chat_id,f"✅ اعتبار شروع کاربران جدید: <b>{fmt_bc(n)}</b>"); await send_admin_wallet_center(chat_id)
+        except Exception: await send_text(chat_id,"❌ عدد صفر یا بیشتر بفرست.")
+        return True
+    if action.startswith("package_edit_"):
+        field=action.replace("package_edit_","")
+        try:
+            if field=="name": val=text.strip()[:60]; dbfield="name"
+            elif field=="credits": val=max(0,int(text.strip().replace(',',''))); dbfield="credits"
+            elif field=="usd": val=max(0,int(round(float(text.strip().replace('$','').replace(',',''))*100))); dbfield="price_usd_cents"
+            elif field=="toman": val=max(0,int(text.strip().replace(',','').replace('تومان','').strip())); dbfield="price_toman"
+            else: raise ValueError()
+            update_credit_package(payload,dbfield,val); audit_admin(user_id,"package.edit",payload,{field:val}); await send_admin_package_detail(chat_id,payload)
+        except Exception: await send_text(chat_id,"❌ مقدار معتبر بفرست.")
+        return True
+    if action=="rate_edit":
+        try:
+            n=max(0,int(text.strip().replace(',',''))); set_credit_rate(payload,n); audit_admin(user_id,"wallet.rate",payload,{"amount":n}); await send_admin_credit_rates(chat_id)
+        except Exception: await send_text(chat_id,"❌ هزینه رو به صورت عدد BlueCredits بفرست؛ 0 یعنی رایگان.")
         return True
     if action=="forcejoin":
         parts=[x.strip() for x in text.split('|',1)]; channel=parts[0]; url=parts[1] if len(parts)>1 else ''
@@ -2427,7 +2762,7 @@ async def show_result_card(chat_id:int,result:dict[str,Any],job_id:str,status_me
 
 
 async def send_account_page(chat_id:int,user_id:int):
-    st=user_download_stats(user_id); lim=effective_daily_limit(user_id); rem="∞" if not lim else max(0,lim-st["today"]); prefs=get_user_prefs(user_id); sub=current_subscription(user_id)
+    st=user_download_stats(user_id); lim=effective_daily_limit(user_id); rem="∞" if not lim else max(0,lim-st["today"]); prefs=get_user_prefs(user_id); sub=current_subscription(user_id); ensure_plan_monthly_credit(user_id); bc=wallet_balance(user_id)
     top=PLATFORM_LABELS.get(st["top"],st["top"]); favs=favorite_count(user_id); q=active_user_queue_count(user_id)
     if user_lang(user_id)=="en":
         text=(f"📊 <b>My Profile</b>\n\n{sub['icon']} Plan: <b>{html.escape(sub['name'])}</b> · ⏳ <b>{format_remaining(sub['expires_at'])}</b>\n📥 Today: <b>{st['today']}</b> / <b>{lim or '∞'}</b>\n🎟 Remaining: <b>{rem}</b>\n"
@@ -2694,6 +3029,7 @@ async def handle_callback_legacy(cb:dict[str,Any]):
             await send_text(chat_id,f"🧹 <b>{count}</b> Job پاک شد.")
         elif action=="users": await admin_users(chat_id)
         elif action=="apis": await send_api_manager(chat_id)
+        elif action=="wallet": await send_admin_wallet_center(chat_id)
         elif action=="services": await send_text(chat_id,"🔌 <b>سرویس‌ها</b>\nروی هر سرویس بزن تا روشن/خاموش بشه.",services_keyboard())
         elif action=="broadcast": set_admin_state(user_id,"broadcast"); await send_text(chat_id,"📢 پیام Broadcast رو همین الان بفرست. HTML تلگرام هم قابل استفاده‌ست.")
         elif action=="userfind": set_admin_state(user_id,"userfind"); await send_text(chat_id,"👤 Telegram ID یا username کاربر رو بفرست.")
@@ -2941,6 +3277,14 @@ def queue_status_keyboard(queue_id:str) -> dict:
                                [{"text":"🏠 خانه","callback_data":"home|home"}]]}
 
 
+def find_paying_subscriber(subs:list[Any],cost:int) -> Any|None:
+    if not subs: return None
+    if cost<=0: return subs[0]
+    for sub in subs:
+        uid=int(sub["user_id"])
+        if uid in ADMIN_IDS or wallet_balance(uid)>=cost: return sub
+    return None
+
 async def enqueue_download(job:dict[str,Any],user_id:int,chat_id:int,kind:str,payload:dict[str,Any]) -> str|None:
     if user_id not in ADMIN_IDS:
         active=active_user_queue_count(user_id); max_active=effective_max_active(user_id); cooldown=effective_cooldown(user_id)
@@ -2977,6 +3321,14 @@ async def enqueue_download(job:dict[str,Any],user_id:int,chat_id:int,kind:str,pa
         txt=("♻️ <b>درخواست مشابه پیدا شد</b>\nبه‌جای دانلود دوباره به همون Job وصل شدی.\n"+
              (f"📍 جایگاه فعلی: <b>{pos}</b>" if pos else "⚙️ فایل همین الان در حال پردازشه."))
         await edit_text(chat_id,status["message_id"],txt,queue_status_keyboard(queue_id)); return queue_id
+    cost,rate_key=estimate_credit_cost(kind,job,payload)
+    if user_id not in ADMIN_IDS and cost>0 and wallet_balance(user_id)<cost:
+        try: await delete_message(chat_id,status["message_id"])
+        except Exception: pass
+        await send_text(chat_id,f"💳 <b>اعتبار کافی نیست</b>\nاین دانلود <b>{fmt_bc(cost)}</b> نیاز داره و موجودی تو <b>{fmt_bc(wallet_balance(user_id))}</b> ـه.",
+                        {"inline_keyboard":[[{"text":"🛒 خرید اعتبار","callback_data":"wallet|packages"},{"text":"💳 کیف پول","callback_data":"wallet|home"}],[{"text":"🏠 خانه","callback_data":"home|home"}]]})
+        return None
+    payload=dict(payload); payload["_wallet_cost"]=cost; payload["_wallet_rate"]=rate_key
     queue_id=secrets.token_urlsafe(7).replace("-","").replace("_","")[:10]
     created=now_ts(); pri=queue_priority(user_id)
     with db() as conn:
@@ -3036,7 +3388,19 @@ async def run_queue_job(queue_id:str) -> None:
     if not subs:
         with db() as conn: conn.execute("UPDATE queue_jobs SET status='cancelled',finished_at=? WHERE queue_id=?",(now_ts(),queue_id))
         return
-    producer=subs[0]
+    payload=json.loads(q["payload_json"] or "{}")
+    cost=max(0,int(payload.get("_wallet_cost",0) or 0)); rate_key=str(payload.get("_wallet_rate") or "download")
+    producer=find_paying_subscriber(subs,cost)
+    if not producer:
+        with db() as conn: conn.execute("UPDATE queue_jobs SET status='failed',finished_at=?,last_error='insufficient BlueCredits' WHERE queue_id=?",(now_ts(),queue_id))
+        await queue_edit_subscribers(queue_id,f"💳 <b>اعتبار کافی نیست</b>\nاین دانلود <b>{fmt_bc(cost)}</b> نیاز داره.",{"inline_keyboard":[[{"text":"🛒 خرید اعتبار","callback_data":"wallet|packages"},{"text":"💳 کیف پول","callback_data":"wallet|home"}]]})
+        return
+    charged_user=0; charged_amount=0
+    if cost>0 and int(producer["user_id"]) not in ADMIN_IDS:
+        ok,_,_=wallet_adjust(int(producer["user_id"]),-cost,"download",f"{rate_key} download")
+        if not ok:
+            await queue_edit_subscribers(queue_id,"💳 اعتبار برای شروع دانلود کافی نبود.",{"inline_keyboard":[[{"text":"🛒 خرید اعتبار","callback_data":"wallet|packages"}]]}); return
+        charged_user=int(producer["user_id"]); charged_amount=cost
     with db() as conn:
         conn.execute("UPDATE queue_jobs SET status='running',started_at=?,attempts=attempts+1 WHERE queue_id=?",(now_ts(),queue_id))
     metric_inc("queue_started")
@@ -3057,9 +3421,11 @@ async def run_queue_job(queue_id:str) -> None:
         with db() as conn: conn.execute("UPDATE queue_jobs SET status='done',finished_at=?,last_error='' WHERE queue_id=?",(now_ts(),queue_id))
         metric_inc("queue_completed")
     except asyncio.CancelledError:
+        if charged_user and charged_amount: wallet_adjust(charged_user,charged_amount,"refund","Cancelled download refund")
         with db() as conn: conn.execute("UPDATE queue_jobs SET status='cancelled',finished_at=?,last_error='cancelled' WHERE queue_id=?",(now_ts(),queue_id))
         await queue_edit_subscribers(queue_id,"❌ <b>دانلود لغو شد</b>",nav_home_keyboard()); raise
     except Exception as exc:
+        if charged_user and charged_amount: wallet_adjust(charged_user,charged_amount,"refund","Failed download refund")
         log_error(int(producer["user_id"]),"queue",exc); q2=queue_get(queue_id); attempts=int(q2["attempts"] or 1); max_attempts=int(q2["max_attempts"] or 1)
         transient=isinstance(exc,(httpx.TransportError,httpx.TimeoutException)) or "429" in str(exc) or "timeout" in str(exc).lower() or "tempor" in str(exc).lower()
         if transient and attempts < max_attempts and queue_subscribers(queue_id,True):
@@ -3158,6 +3524,57 @@ async def handle_callback(cb:dict[str,Any]):
     cb_id=cb["id"]; message=cb.get("message") or {}; chat_id=message.get("chat",{}).get("id")
     user=cb.get("from",{}); user_id=user.get("id"); data=cb.get("data",""); upsert_user(user)
     if not chat_id: return await handle_callback_legacy(cb)
+    # V5.2 wallet user actions
+    if data.startswith("wallet|") or data.startswith("walletpkg|"):
+        if user_id not in ADMIN_IDS and (is_banned(user_id) or bool_setting('maintenance',False)): return await safe_answer_callback(cb_id,'Unavailable',True)
+        if not await is_joined(user_id): await safe_answer_callback(cb_id,'اول عضو کانال شو.',True); return
+        await safe_answer_callback(cb_id)
+        if data=="wallet|home": return await send_wallet_page(chat_id,user_id)
+        if data=="wallet|packages": return await send_credit_packages_page(chat_id,user_id)
+        if data=="wallet|history": return await send_wallet_history(chat_id,user_id)
+        if data=="wallet|rates": return await send_user_credit_rates(chat_id,user_id)
+        if data.startswith("walletpkg|"): return await send_credit_package_user(chat_id,user_id,data.split('|',1)[1])
+    # V5.2 wallet admin actions
+    wallet_admin_prefixes=("walletadm|","pkgadm|","pkgedit|","pkgtoggle|","pkgdel|","rateedit|","walletuser|","walletplus|","walletminus|","walletcustom|","walletuserpkgs|","walletgrantpkg|")
+    if data=="adm|wallet" or data=="pkgnew" or data.startswith(wallet_admin_prefixes):
+        if user_id not in ADMIN_IDS: return await safe_answer_callback(cb_id,'Access denied',True)
+        await safe_answer_callback(cb_id)
+        if data=="adm|wallet": return await send_admin_wallet_center(chat_id)
+        if data=="walletadm|packages": return await send_admin_packages(chat_id)
+        if data=="walletadm|rates": return await send_admin_credit_rates(chat_id)
+        if data=="walletadm|welcome": set_admin_state(user_id,"wallet_welcome"); return await send_text(chat_id,f"🎁 اعتبار شروع فعلی: <b>{fmt_bc(int(get_setting('welcome_credits','0') or 0))}</b>\nعدد جدید رو بفرست؛ 0 یعنی بدون هدیه.")
+        if data=="walletadm|find": set_admin_state(user_id,"wallet_find"); return await send_text(chat_id,"🔎 Telegram ID یا username کاربر رو بفرست.")
+        if data=="walletadm|tx": return await send_admin_wallet_transactions(chat_id)
+        if data=="pkgnew":
+            pid=create_credit_package(); audit_admin(user_id,"package.create",pid); return await send_admin_package_detail(chat_id,pid)
+        if data.startswith("pkgadm|"): return await send_admin_package_detail(chat_id,data.split('|',1)[1])
+        if data.startswith("pkgedit|"):
+            _,pid,field=data.split('|',2); set_admin_state(user_id,"package_edit_"+field,pid)
+            prompts={"name":"اسم جدید بسته رو بفرست.","credits":"مقدار BlueCredits بسته رو بفرست. مثال: <code>50000</code>","usd":"قیمت دلاری رو بفرست. مثال: <code>3.49</code>","toman":"قیمت تومانی رو بفرست. مثال: <code>449000</code>"}
+            return await send_text(chat_id,prompts.get(field,"مقدار جدید رو بفرست."))
+        if data.startswith("pkgtoggle|"):
+            pid=data.split('|',1)[1]; r=get_credit_package(pid)
+            if r: update_credit_package(pid,"active",0 if int(r["active"]) else 1); audit_admin(user_id,"package.toggle",pid)
+            return await send_admin_package_detail(chat_id,pid)
+        if data.startswith("pkgdel|"):
+            pid=data.split('|',1)[1]; delete_credit_package(pid); audit_admin(user_id,"package.delete",pid); return await send_admin_packages(chat_id)
+        if data.startswith("rateedit|"):
+            rk=data.split('|',1)[1]; set_admin_state(user_id,"rate_edit",rk); return await send_text(chat_id,f"هزینه جدید <b>{html.escape(CREDIT_RATE_DEFAULTS.get(rk,(rk,0))[0])}</b> رو به BlueCredits بفرست.\n0 یعنی رایگان.")
+        if data.startswith("walletuserpkgs|"): return await send_admin_user_packages(chat_id,int(data.split('|',1)[1]))
+        if data.startswith("walletgrantpkg|"):
+            _,uid_s,pid=data.split('|',2); uid=int(uid_s); pkg=get_credit_package(pid)
+            if not pkg or not int(pkg["active"]): return await send_text(chat_id,"❌ بسته فعال نیست.")
+            wallet_adjust(uid,int(pkg["credits"]),"package_purchase",f"Package: {pkg['name']}",user_id); audit_admin(user_id,"wallet.package",uid_s,{"package":pid,"credits":int(pkg["credits"])})
+            await send_text(chat_id,f"✅ <b>{fmt_bc(pkg['credits'])}</b> از بسته <b>{html.escape(pkg['name'])}</b> اضافه شد."); return await send_admin_wallet_user(chat_id,uid)
+        if data.startswith("walletuser|"): return await send_admin_wallet_user(chat_id,int(data.split('|',1)[1]))
+        if data.startswith("walletplus|"):
+            _,uid_s,n_s=data.split('|'); uid=int(uid_s); n=int(n_s); wallet_adjust(uid,n,"admin_adjust","Admin credit",user_id); audit_admin(user_id,"wallet.add",uid_s,{"amount":n}); return await send_admin_wallet_user(chat_id,uid)
+        if data.startswith("walletminus|"):
+            _,uid_s,n_s=data.split('|'); uid=int(uid_s); n=int(n_s); ok,_,_=wallet_adjust(uid,-n,"admin_adjust","Admin debit",user_id)
+            if not ok: await send_text(chat_id,"❌ موجودی کافی نیست."); return await send_admin_wallet_user(chat_id,uid)
+            audit_admin(user_id,"wallet.sub",uid_s,{"amount":n}); return await send_admin_wallet_user(chat_id,uid)
+        if data.startswith("walletcustom|"):
+            _,uid_s,mode=data.split('|'); set_admin_state(user_id,"wallet_add_custom" if mode=="add" else "wallet_sub_custom",uid_s); return await send_text(chat_id,"مقدار BlueCredits رو به صورت عدد مثبت بفرست.")
     # V5 user membership actions
     if data.startswith('sub|'):
         if user_id not in ADMIN_IDS and (is_banned(user_id) or bool_setting('maintenance',False)): return await safe_answer_callback(cb_id,'Unavailable',True)
@@ -3210,7 +3627,7 @@ async def handle_callback(cb:dict[str,Any]):
         cid=data.split('|',1)[1];
         with db() as conn: conn.execute('UPDATE campaigns SET active=0 WHERE campaign_id=?',(cid,))
         audit_admin(user_id,'campaign.stop',cid); await safe_answer_callback(cb_id,'متوقف شد'); return await send_admin_campaigns(chat_id)
-    user_ux = data.startswith(("home|","sub|","pref|","recent|","favadd|","favlast|","favsend|","favdel|","again|","retry|","retryms|","report|","ms|","sp|","all|","a|","d|","qstatus|","qcancel|"))
+    user_ux = data.startswith(("home|","sub|","wallet|","walletpkg|","pref|","recent|","favadd|","favlast|","favsend|","favdel|","again|","retry|","retryms|","report|","ms|","sp|","all|","a|","d|","qstatus|","qcancel|"))
     if user_ux and user_id not in ADMIN_IDS and is_banned(user_id):
         await safe_answer_callback(cb_id,"دسترسی مسدود است.",True); return
     if user_ux and user_id not in ADMIN_IDS and bool_setting("maintenance",False):

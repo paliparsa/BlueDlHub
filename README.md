@@ -1,49 +1,112 @@
 # BlueGate Downloader
 
-Telegram media downloader with persistent PostgreSQL storage, queueing, cache, memberships, and a multi-key FastSaver pool.
+Telegram media downloader with PostgreSQL persistence, queueing, smart cache, memberships, BlueCredits wallet, and a multi-key FastSaver pool.
 
 ## Supported sources
 
-- Instagram — posts, Reels, photo posts, carousels, Stories and Highlights
-- TikTok — videos, photo posts/slideshows, plus the post audio when available
-- YouTube — video and audio
-- X / Twitter — direct extractor first, FastSaver fallback if direct extraction fails
+- Instagram — Post / Reel / Carousel / Story / Highlight
+- TikTok — Video / Photo / Slideshow / post audio
+- YouTube — Video and Audio
+- X / Twitter — direct extractor first, FastSaver fallback
 - SoundCloud — direct audio extraction
-- Spotify — music search + audio download
+- Spotify — Music Search + Music Download
 
-Only publicly reachable media is supported for Instagram, TikTok and X.
+## BlueCredits wallet
 
-## Social download routing
+V5.2 adds an internal credit wallet. BlueCredits are controlled entirely by the bot admin and are not tied 1:1 to FastSaver credits.
 
-- Instagram: FastSaver `/fetch`
-- TikTok: FastSaver `/fetch`
-- X / Twitter: direct `yt-dlp` first; FastSaver `/fetch` only as fallback
-- SoundCloud: direct `yt-dlp`
-- YouTube: FastSaver YouTube endpoints
-- Spotify: FastSaver Music Search + Music Download
+User menu:
 
-Instagram no longer needs an Instagram login, session file, cookie export or Instaloader.
+```text
+/start → Wallet
+```
 
-FastSaver `/fetch` currently costs 1.5 credits for normal Instagram posts/Reels/carousels, TikTok posts and X posts. Instagram Stories/Highlights cost 5 credits. Signed media URLs are downloaded immediately; if one expires while waiting in queue, the bot resolves it once more.
+Users can see:
 
-## Core features
+- Current BlueCredits balance
+- Recent wallet transactions
+- Active credit packages
+- Package prices in USD and Toman
+- Current download rates
 
-- Separate User/Admin modes
-- Free / VIP / Premium plans
-- Redeem codes and referral rewards
-- Priority download queue
-- Duplicate-job detection and shared delivery
-- Telegram `file_id` smart cache
-- Recent downloads, favorites and history search
-- Batch link processing
-- Quick Download preferences
-- Multiple FastSaver API keys with automatic fallback
-- FastSaver health monitoring
-- Per-user limits, bans and overrides
-- Campaigns, analytics and audit log
-- Force Join, broadcast and maintenance mode
-- Persian / English user interface
-- Persistent PostgreSQL storage via Neon
+Smart Cache delivery does not charge BlueCredits again. If a fresh queued download fails or is cancelled after charging, the charge is refunded automatically.
+
+## Admin pricing
+
+No pricing values need to be stored in Render environment variables.
+
+Open:
+
+```text
+/start → Admin Mode → BlueCredits
+```
+
+The admin can manage:
+
+- Credit packages
+- Package name
+- BlueCredits amount
+- USD price
+- Toman price
+- Package active/inactive state
+- Per-service download cost
+- Welcome credits for new users
+- Individual user balances
+- Recent wallet transactions
+
+To create a package:
+
+```text
+BlueCredits → Manage Packages → New Package
+```
+
+Open the package and use the buttons for Name, Credits, USD and Toman. Activate the package when it is ready to be shown to users.
+
+After receiving payment manually, open:
+
+```text
+Users → User → Wallet → Apply Package
+```
+
+and select the purchased package. The package balance is added to the user and recorded in wallet history and the admin audit log.
+
+## Default download rates
+
+These are only initial values. Every value can be edited from the Telegram admin panel.
+
+```text
+Instagram Post/Reel/Carousel   15 BC
+Instagram Story/Highlight      50 BC
+TikTok                         15 BC
+X / Twitter                    15 BC
+YouTube                        150 BC
+YouTube 2K/4K                  250 BC
+YouTube Audio                  90 BC
+Spotify Music                  90 BC
+SoundCloud                     0 BC
+```
+
+Set any rate to `0` to make that route free.
+
+## Membership monthly credits
+
+Each plan now has a `Monthly BC` field in:
+
+```text
+Admin → Plans → Select Plan → Monthly BC
+```
+
+If set above zero, an active user receives that amount once per 30-day membership cycle. The default is zero for all plans until the admin changes it.
+
+## FastSaver pool
+
+An optional first FastSaver key can be supplied through `FASTSAVER_API_KEY`. Additional keys are managed from:
+
+```text
+Admin Mode → FastSaver APIs
+```
+
+When a key is rate-limited, exhausted, invalid, or temporarily unavailable, the pool can fall back to another configured key.
 
 ## Required Render environment variables
 
@@ -55,16 +118,10 @@ ADMIN_IDS=YOUR_TELEGRAM_USER_ID
 DATABASE_URL=YOUR_NEON_POSTGRES_CONNECTION_STRING
 ```
 
-Optional bootstrap FastSaver key:
+Optional bootstrap API key:
 
 ```env
 FASTSAVER_API_KEY=fs_sk_xxxxxxxxx
-```
-
-Additional FastSaver keys are managed from the Telegram admin panel:
-
-```text
-/start → Admin Mode → FastSaver APIs
 ```
 
 ## Optional settings
@@ -91,18 +148,20 @@ BATCH_MAX_LINKS=25
 
 ## Neon
 
-Create a Neon PostgreSQL project, copy its pooled connection string, and save it in Render as `DATABASE_URL`. Tables and migrations are created automatically at startup; no manual SQL setup is required.
+Create a Neon PostgreSQL project, copy its pooled connection string and save it in Render as `DATABASE_URL`.
 
-If `DATABASE_URL` is missing, the app falls back to local SQLite. Local SQLite on a free Render instance should not be treated as persistent storage.
+No manual SQL migration is required. Wallets, packages, transactions, download rates and membership credit-grant tables are created automatically on startup. Existing users, API keys, plans, queue data and cache are preserved.
+
+If `DATABASE_URL` is missing, the app falls back to SQLite. Local SQLite on a free Render instance should not be considered persistent storage.
 
 ## Deploy on Render
 
-1. Put all files from this project in the root of the GitHub repository.
+1. Put all project files directly in the root of the GitHub repository.
 2. Connect the repository to a Render Web Service.
 3. Use the included Dockerfile.
 4. Add the required environment variables.
 5. Deploy.
-6. Open Telegram and use `/start`.
+6. Open the Telegram bot and use `/start`.
 
 Repository root:
 
@@ -119,4 +178,4 @@ README.md
 
 ## Updating
 
-Replace the project files in the repository root and commit. Render can automatically deploy the new commit. Keep secrets only in Render/Neon, never in GitHub.
+Replace these project files in the repository root and commit. Render can deploy the new commit automatically. Keep API keys, bot tokens and database credentials out of GitHub.
